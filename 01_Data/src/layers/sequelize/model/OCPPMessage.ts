@@ -69,11 +69,4 @@ export class OCPPMessage extends Model implements OCPPMessageDto {
       instance.tenantId = DEFAULT_TENANT_ID;
     }
   }
-
-  constructor(...args: any[]) {
-    super(...args);
-    if (this.tenantId == null) {
-      this.tenantId = DEFAULT_TENANT_ID;
-    }
-  }
 }

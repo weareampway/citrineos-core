@@ -20,16 +20,23 @@ export class SequelizeTariffRepository
   }
 
   async findByStationIds(tenantId: number, stationIds: string[]): Promise<Tariff[] | undefined> {
+    const validStationIds = stationIds.filter((id): id is string => id != null);
+    if (validStationIds.length === 0) {
+      return [];
+    }
     return super.readAllByQuery(tenantId, {
       where: {
         stationId: {
-          [Op.in]: stationIds,
+          [Op.in]: validStationIds,
         },
       },
     });
   }
 
   async findByStationId(tenantId: number, stationId: string): Promise<Tariff | undefined> {
+    if (stationId == null) {
+      return undefined;
+    }
     return super.readOnlyOneByQuery(tenantId, {
       where: {
         stationId: stationId,

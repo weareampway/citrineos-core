@@ -139,6 +139,9 @@ export function createDockerConfig() {
         host: '0.0.0.0',
         port: 8088,
         responses: [
+          OCPP1_6_CallAction.ClearChargingProfile,
+          OCPP1_6_CallAction.GetCompositeSchedule,
+          OCPP1_6_CallAction.SetChargingProfile,
           OCPP2_0_1_CallAction.ClearChargingProfile,
           OCPP2_0_1_CallAction.GetChargingProfiles,
           OCPP2_0_1_CallAction.GetCompositeSchedule,

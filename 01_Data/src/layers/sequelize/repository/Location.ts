@@ -25,6 +25,7 @@ export class SequelizeLocationRepository
   chargingStation: CrudRepository<ChargingStation>;
   statusNotification: CrudRepository<StatusNotification>;
   latestStatusNotification: CrudRepository<LatestStatusNotification>;
+  evse: CrudRepository<Evse>;
   connector: CrudRepository<Connector>;
 
   constructor(
@@ -34,6 +35,7 @@ export class SequelizeLocationRepository
     chargingStation?: CrudRepository<ChargingStation>,
     statusNotification?: CrudRepository<StatusNotification>,
     latestStatusNotification?: CrudRepository<LatestStatusNotification>,
+    evse?: CrudRepository<Evse>,
     connector?: CrudRepository<Connector>,
   ) {
     super(config, Location.MODEL_NAME, logger, sequelizeInstance);
@@ -61,6 +63,9 @@ export class SequelizeLocationRepository
           logger,
           sequelizeInstance,
         );
+    this.evse = evse
+      ? evse
+      : new SequelizeRepository<Evse>(config, Evse.MODEL_NAME, logger, sequelizeInstance);
     this.connector = connector
       ? connector
       : new SequelizeRepository<Connector>(config, Connector.MODEL_NAME, logger, sequelizeInstance);
@@ -286,6 +291,26 @@ export class SequelizeLocationRepository
     }
   }
 
+  async createOrUpdateEvse(
+    tenantId: number,
+    evse: Partial<Evse> & { stationId: string; evseTypeId: number },
+  ): Promise<Evse | undefined> {
+    const [savedEvse] = await this.evse.readOrCreateByQuery(tenantId, {
+      where: {
+        tenantId,
+        stationId: evse.stationId,
+        evseTypeId: evse.evseTypeId,
+      },
+      defaults: {
+        tenantId,
+        stationId: evse.stationId,
+        evseTypeId: evse.evseTypeId,
+        evseId: evse.evseId ?? `${evse.stationId}-${evse.evseTypeId}`,
+      },
+    });
+    return savedEvse;
+  }
+
   async createOrUpdateConnector(
     tenantId: number,
     connector: Connector,
@@ -301,7 +326,9 @@ export class SequelizeLocationRepository
             connectorId: connector.connectorId,
           },
           defaults: {
-            ...connector,
+            ...(connector && 'dataValues' in connector && connector.dataValues != null
+              ? connector.dataValues
+              : connector),
           },
           transaction: sequelizeTransaction,
         },

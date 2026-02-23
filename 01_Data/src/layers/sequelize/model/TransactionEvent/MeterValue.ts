@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2025 Contributors to the CitrineOS Project
 //
 // SPDX-License-Identifier: Apache-2.0
-import type { MeterValueDto, TenantDto, SampledValue } from '@citrineos/base';
+import type { MeterValueDto, SampledValue, TenantDto } from '@citrineos/base';
 import { DEFAULT_TENANT_ID, Namespace } from '@citrineos/base';
 import {
   BeforeCreate,
@@ -13,11 +13,11 @@ import {
   Model,
   Table,
 } from 'sequelize-typescript';
-import { TransactionEvent } from './TransactionEvent.js';
-import { Transaction } from './Transaction.js';
-import { StopTransaction } from './StopTransaction.js';
-import { Tenant } from '../Tenant.js';
 import { Tariff } from '../Tariff/index.js';
+import { Tenant } from '../Tenant.js';
+import { StopTransaction } from './StopTransaction.js';
+import { Transaction } from './Transaction.js';
+import { TransactionEvent } from './TransactionEvent.js';
 
 @Table
 export class MeterValue extends Model implements MeterValueDto {
@@ -75,13 +75,6 @@ export class MeterValue extends Model implements MeterValueDto {
   static setDefaultTenant(instance: MeterValue) {
     if (instance.tenantId == null) {
       instance.tenantId = DEFAULT_TENANT_ID;
-    }
-  }
-
-  constructor(...args: any[]) {
-    super(...args);
-    if (this.tenantId == null) {
-      this.tenantId = DEFAULT_TENANT_ID;
     }
   }
 }

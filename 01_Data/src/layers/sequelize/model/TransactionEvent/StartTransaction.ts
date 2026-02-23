@@ -13,9 +13,9 @@ import {
   Model,
   Table,
 } from 'sequelize-typescript';
-import { Transaction } from './Transaction.js';
 import { Connector } from '../Location/index.js';
 import { Tenant } from '../Tenant.js';
+import { Transaction } from './Transaction.js';
 
 @Table
 export class StartTransaction extends Model implements StartTransactionDto {
@@ -71,13 +71,6 @@ export class StartTransaction extends Model implements StartTransactionDto {
   static setDefaultTenant(instance: StartTransaction) {
     if (instance.tenantId == null) {
       instance.tenantId = DEFAULT_TENANT_ID;
-    }
-  }
-
-  constructor(...args: any[]) {
-    super(...args);
-    if (this.tenantId == null) {
-      this.tenantId = DEFAULT_TENANT_ID;
     }
   }
 }

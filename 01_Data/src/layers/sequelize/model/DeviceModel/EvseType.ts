@@ -73,11 +73,4 @@ export class EvseType extends Model implements OCPP2_0_1.EVSEType, EvseTypeDto {
       instance.tenantId = DEFAULT_TENANT_ID;
     }
   }
-
-  constructor(...args: any[]) {
-    super(...args);
-    if (this.tenantId == null) {
-      this.tenantId = DEFAULT_TENANT_ID;
-    }
-  }
 }

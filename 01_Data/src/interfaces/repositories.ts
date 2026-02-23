@@ -242,6 +242,10 @@ export interface ILocationRepository extends CrudRepository<Location> {
     tenantId: number,
     chargingStation: ChargingStation,
   ): Promise<ChargingStation>;
+  createOrUpdateEvse(
+    tenantId: number,
+    evse: Partial<Evse> & { stationId: string; evseTypeId: number },
+  ): Promise<Evse | undefined>;
   createOrUpdateConnector(tenantId: number, connector: Connector): Promise<Connector | undefined>;
   updateAllConnectorsByQuery(
     tenantId: number,
@@ -325,6 +329,7 @@ export interface ITransactionEventRepository extends CrudRepository<TransactionE
     evseId: number,
   ): Promise<Transaction | undefined>;
   updateTransactionTotalCostById(tenantId: number, totalCost: number, id: number): Promise<void>;
+  updateTransactionTotalKwhById(tenantId: number, totalKwh: number, id: number): Promise<void>;
   createStopTransaction(
     tenantId: number,
     transactionDatabaseId: number,

@@ -15,9 +15,9 @@ import {
   Table,
 } from 'sequelize-typescript';
 import { EvseType } from '../DeviceModel/index.js';
+import { Tenant } from '../Tenant.js';
 import { MeterValue } from './MeterValue.js';
 import { Transaction } from './Transaction.js';
-import { Tenant } from '../Tenant.js';
 
 @Table
 export class TransactionEvent extends Model implements TransactionEventDto {
@@ -98,13 +98,6 @@ export class TransactionEvent extends Model implements TransactionEventDto {
   static setDefaultTenant(instance: TransactionEvent) {
     if (instance.tenantId == null) {
       instance.tenantId = DEFAULT_TENANT_ID;
-    }
-  }
-
-  constructor(...args: any[]) {
-    super(...args);
-    if (this.tenantId == null) {
-      this.tenantId = DEFAULT_TENANT_ID;
     }
   }
 }

@@ -150,13 +150,6 @@ export class Tariff extends Model implements TariffDto {
       instance.tenantId = DEFAULT_TENANT_ID;
     }
   }
-
-  constructor(...args: any[]) {
-    super(...args);
-    if (this.tenantId == null) {
-      this.tenantId = DEFAULT_TENANT_ID;
-    }
-  }
 }
 
 export interface TariffData {

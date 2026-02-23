@@ -596,7 +596,23 @@ export class SequelizeTransactionEventRepository
     totalCost: number,
     id: number,
   ): Promise<void> {
-    await this.transaction.updateByKey(tenantId, { totalCost: totalCost }, id.toString());
+    await this.transaction.updateAllByQuery(
+      tenantId,
+      { totalCost },
+      { where: { id, tenantId }, fields: ['totalCost', 'updatedAt'] },
+    );
+  }
+
+  async updateTransactionTotalKwhById(
+    tenantId: number,
+    totalKwh: number,
+    id: number,
+  ): Promise<void> {
+    await this.transaction.updateAllByQuery(
+      tenantId,
+      { totalKwh },
+      { where: { id, tenantId }, fields: ['totalKwh', 'updatedAt'] },
+    );
   }
 
   async updateTransactionByMeterValues(

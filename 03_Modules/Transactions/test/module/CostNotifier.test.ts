@@ -27,6 +27,7 @@ describe('CostNotifier', () => {
     transactionEventRepository = {
       readTransactionByStationIdAndTransactionId: vi.fn(),
       updateTransactionTotalCostById: vi.fn(),
+      updateTransactionTotalKwhById: vi.fn(),
     } as unknown as Mocked<ITransactionEventRepository>;
 
     module = {

@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2025 Contributors to the CitrineOS Project
 //
 // SPDX-License-Identifier: Apache-2.0
-import type { OCPPVersionType, WebsocketServerConfig, TenantDto } from '@citrineos/base';
+import type { OCPPVersionType, TenantDto, WebsocketServerConfig } from '@citrineos/base';
 import { DEFAULT_TENANT_ID, OCPP2_0_1_Namespace } from '@citrineos/base';
 import {
   BeforeCreate,
@@ -80,13 +80,6 @@ export class ServerNetworkProfile extends Model implements WebsocketServerConfig
   static setDefaultTenant(instance: ServerNetworkProfile) {
     if (instance.tenantId == null) {
       instance.tenantId = DEFAULT_TENANT_ID;
-    }
-  }
-
-  constructor(...args: any[]) {
-    super(...args);
-    if (this.tenantId == null) {
-      this.tenantId = DEFAULT_TENANT_ID;
     }
   }
 }

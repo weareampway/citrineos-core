@@ -4,6 +4,7 @@
 
 import type { BootstrapConfig } from '@citrineos/base';
 import { CrudRepository, OCPP2_0_1 } from '@citrineos/base';
+import { UniqueConstraintError } from 'sequelize';
 import { SequelizeRepository } from './Base.js';
 import type { IChargingProfileRepository } from '../../../interfaces/index.js';
 import {
@@ -107,25 +108,53 @@ export class SequelizeChargingProfileRepository
       transactionDBId = activeTransaction?.id;
     }
 
-    const [savedChargingProfile, profileCreated] = await this.readOrCreateByQuery(tenantId, {
-      where: {
-        tenantId: tenantId,
-        stationId: stationId,
-        id: chargingProfile.id,
-      },
-      defaults: {
-        ...chargingProfile,
-        evseId: evseId,
-        transactionDatabaseId: transactionDBId,
-        chargingLimitSource: chargingLimitSource ?? OCPP2_0_1.ChargingLimitSourceEnumType.CSO,
-        isActive: isActive === undefined ? false : isActive,
-      },
-    });
+    const defaults = {
+      tenantId,
+      stationId,
+      id: chargingProfile.id,
+      chargingProfileKind: chargingProfile.chargingProfileKind,
+      chargingProfilePurpose: chargingProfile.chargingProfilePurpose,
+      stackLevel: chargingProfile.stackLevel,
+      validFrom: chargingProfile.validFrom,
+      validTo: chargingProfile.validTo,
+      recurrencyKind: chargingProfile.recurrencyKind,
+      evseId: evseId,
+      transactionDatabaseId: transactionDBId,
+      chargingLimitSource: chargingLimitSource ?? OCPP2_0_1.ChargingLimitSourceEnumType.CSO,
+      isActive: isActive === undefined ? false : isActive,
+    };
+
+    let savedChargingProfile: ChargingProfile;
+    let profileCreated: boolean;
+
+    try {
+      [savedChargingProfile, profileCreated] = await this.readOrCreateByQuery(tenantId, {
+        where: {
+          tenantId,
+          stationId,
+          id: chargingProfile.id,
+        },
+        defaults,
+      });
+    } catch (error) {
+      if (error instanceof UniqueConstraintError) {
+        const existing = await this.readAllByQuery(tenantId, {
+          where: { stationId, id: chargingProfile.id },
+        });
+        if (existing.length === 0) throw error;
+        savedChargingProfile = existing[0] as ChargingProfile;
+        profileCreated = false;
+      } else {
+        throw error;
+      }
+    }
     if (!profileCreated) {
+      const resolvedTenantId = savedChargingProfile.tenantId;
       await this.updateByKey(
-        tenantId,
+        resolvedTenantId,
         {
           ...chargingProfile,
+          tenantId: resolvedTenantId,
           chargingSchedule: chargingProfile.chargingSchedule.map((s) => ({ ...s })) as
             | [ChargingSchedule]
             | [ChargingSchedule, ChargingSchedule]
@@ -139,13 +168,16 @@ export class SequelizeChargingProfileRepository
         savedChargingProfile.databaseId.toString(),
       );
       // delete existed charging schedules and sales tariff
-      const deletedChargingSchedules = await this.chargingSchedule.deleteAllByQuery(tenantId, {
-        where: {
-          chargingProfileDatabaseId: savedChargingProfile.databaseId,
+      const deletedChargingSchedules = await this.chargingSchedule.deleteAllByQuery(
+        resolvedTenantId,
+        {
+          where: {
+            chargingProfileDatabaseId: savedChargingProfile.databaseId,
+          },
         },
-      });
+      );
       for (const deletedSchedule of deletedChargingSchedules) {
-        await this.salesTariff.deleteAllByQuery(tenantId, {
+        await this.salesTariff.deleteAllByQuery(resolvedTenantId, {
           where: {
             chargingScheduleDatabaseId: deletedSchedule.databaseId,
           },
@@ -153,11 +185,12 @@ export class SequelizeChargingProfileRepository
       }
     }
 
+    const effectiveTenantId = profileCreated ? tenantId : savedChargingProfile.tenantId;
     for (const chargingSchedule of chargingProfile.chargingSchedule) {
       const savedChargingSchedule = await this.chargingSchedule.create(
-        tenantId,
+        effectiveTenantId,
         ChargingSchedule.build({
-          tenantId,
+          tenantId: effectiveTenantId,
           stationId,
           chargingProfileDatabaseId: savedChargingProfile.databaseId,
           ...chargingSchedule,
@@ -165,9 +198,9 @@ export class SequelizeChargingProfileRepository
       );
       if (chargingSchedule.salesTariff) {
         await this.salesTariff.create(
-          tenantId,
+          effectiveTenantId,
           SalesTariff.build({
-            tenantId,
+            tenantId: effectiveTenantId,
             chargingScheduleDatabaseId: savedChargingSchedule.databaseId,
             ...chargingSchedule.salesTariff,
           }),

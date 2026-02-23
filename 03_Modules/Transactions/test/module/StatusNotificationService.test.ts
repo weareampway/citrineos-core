@@ -44,6 +44,7 @@ describe('StatusNotificationService', () => {
     locationRepository = {
       addStatusNotificationToChargingStation: vi.fn(),
       readChargingStationByStationId: vi.fn(),
+      createOrUpdateEvse: vi.fn().mockResolvedValue(aEvse()),
       createOrUpdateConnector: vi.fn(),
     } as unknown as Mocked<ILocationRepository>;
 
@@ -158,7 +159,11 @@ describe('StatusNotificationService', () => {
 
   describe('Test process OCPP 1.6 StatusNotification', () => {
     it('should save StatusNotification and connector when Charging Station exists', async () => {
-      locationRepository.readChargingStationByStationId.mockResolvedValue(aChargingStation());
+      locationRepository.readChargingStationByStationId.mockResolvedValue(
+        aChargingStation((cs) => {
+          cs.evses = [aEvse()];
+        }),
+      );
       vi.spyOn(StatusNotification, 'build').mockImplementation(() => {
         return aStatusNotification();
       });
@@ -166,7 +171,9 @@ describe('StatusNotificationService', () => {
       await statusNotificationService.processOcpp16StatusNotification(
         DEFAULT_TENANT_ID,
         MOCK_STATION_ID,
-        aOcpp16StatusNotificationRequest(),
+        aOcpp16StatusNotificationRequest((req) => {
+          req.connectorId = MOCK_CONNECTOR_ID;
+        }),
       );
 
       expect(locationRepository.addStatusNotificationToChargingStation).toHaveBeenCalled();

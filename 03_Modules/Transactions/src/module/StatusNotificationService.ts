@@ -63,10 +63,28 @@ export class StatusNotificationService {
         statusNotification,
       );
 
+      let matchingEvse = chargingStation.evses?.find(
+        (evse) => evse.evseTypeId === statusNotificationRequest.evseId,
+      );
+      if (!matchingEvse) {
+        const createdEvse = await this._locationRepository.createOrUpdateEvse(tenantId, {
+          tenantId,
+          stationId,
+          evseTypeId: statusNotificationRequest.evseId,
+          evseId: `${stationId}-${statusNotificationRequest.evseId}`,
+        });
+        if (createdEvse) {
+          matchingEvse = createdEvse;
+        }
+      }
       const connector = {
         tenantId,
-        connectorId: statusNotificationRequest.connectorId,
+        connectorId: statusNotificationRequest.evseId,
         stationId,
+        ...(matchingEvse && {
+          evseId: matchingEvse.id,
+          evseTypeConnectorId: statusNotificationRequest.connectorId,
+        }),
         status: OCPP2_0_1_Mapper.LocationMapper.mapConnectorStatus(
           statusNotificationRequest.connectorStatus,
         ),
@@ -74,7 +92,13 @@ export class StatusNotificationService {
           ? statusNotificationRequest.timestamp
           : new Date().toISOString(),
       } as Connector;
-      await this._locationRepository.createOrUpdateConnector(tenantId, connector);
+      if (matchingEvse) {
+        await this._locationRepository.createOrUpdateConnector(tenantId, connector);
+      } else {
+        this._logger.warn(
+          `Evse ${statusNotificationRequest.evseId} not found for station ${stationId}. Connector status will not be persisted.`,
+        );
+      }
 
       let components = await this._componentRepository.readAllByQuery(tenantId, {
         where: {
@@ -141,9 +165,10 @@ export class StatusNotificationService {
     );
     if (chargingStation) {
       const matchingEvse = chargingStation.evses?.find((evse) =>
-        evse.connectors?.find(
-          (connector) => connector.connectorId === statusNotificationRequest.connectorId,
-        ),
+        evse.connectors?.some((c) => c.connectorId === statusNotificationRequest.connectorId),
+      );
+      const matchingConnector = matchingEvse?.connectors?.find(
+        (c) => c.connectorId === statusNotificationRequest.connectorId,
       );
       const statusNotificationInput: Partial<StatusNotification> = {
         tenantId,
@@ -165,6 +190,11 @@ export class StatusNotificationService {
         tenantId,
         connectorId: statusNotificationRequest.connectorId,
         stationId,
+        ...(matchingEvse && {
+          evseId: matchingEvse.id,
+          evseTypeConnectorId:
+            matchingConnector?.evseTypeConnectorId ?? statusNotificationRequest.connectorId,
+        }),
         status: OCPP1_6_Mapper.LocationMapper.mapStatusNotificationRequestStatusToConnectorStatus(
           statusNotificationRequest.status,
         ),
@@ -181,7 +211,6 @@ export class StatusNotificationService {
       } as Connector;
 
       if (chargingStation.use16StatusNotification0 && statusNotificationRequest.connectorId === 0) {
-        // update all connectors
         await this._locationRepository.updateAllConnectorsByQuery(
           tenantId,
           {
@@ -195,8 +224,12 @@ export class StatusNotificationService {
             },
           },
         );
-      } else {
+      } else if (matchingEvse) {
         await this._locationRepository.createOrUpdateConnector(tenantId, connector);
+      } else {
+        this._logger.warn(
+          `No Evse with connector ${statusNotificationRequest.connectorId} found for station ${stationId}. Connector status will not be persisted.`,
+        );
       }
     } else {
       this._logger.warn(

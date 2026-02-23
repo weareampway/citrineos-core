@@ -11,6 +11,7 @@ import { HttpMethod, METADATA_DATA_ENDPOINTS, METADATA_MESSAGE_ENDPOINTS } from 
 import type { OcppRequest, SystemConfig } from '../../index.js';
 import {
   ConfigStoreFactory,
+  DEFAULT_TENANT_ID,
   MessageConfirmationSchema,
   Namespace,
   OCPP1_6_Namespace,
@@ -130,13 +131,22 @@ export abstract class AbstractModuleApi<T extends IModule> implements IModuleApi
       const { identifier, tenantId, callbackUrl, ...extraQueries } = request.query;
 
       const identifiers = Array.isArray(identifier) ? identifier : [identifier];
+      let resolvedTenantId: number | undefined =
+        tenantId != null
+          ? typeof tenantId === 'string'
+            ? parseInt(tenantId, 10)
+            : tenantId
+          : undefined;
+      if (resolvedTenantId === undefined || Number.isNaN(resolvedTenantId)) {
+        resolvedTenantId = DEFAULT_TENANT_ID;
+      }
 
       return method.call(
         this,
         identifiers,
         request.body,
         callbackUrl,
-        tenantId,
+        resolvedTenantId,
         Object.keys(extraQueries).length > 0 ? extraQueries : undefined,
       );
     };

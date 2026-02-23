@@ -23,7 +23,7 @@ import type {
   IReservationRepository,
   ITransactionEventRepository,
 } from '@citrineos/data';
-import { OCPP1_6_Mapper, OCPP2_0_1_Mapper, Transaction } from '@citrineos/data';
+import { OCPP1_6_Mapper, OCPP2_0_1_Mapper } from '@citrineos/data';
 import type { ILogObj } from 'tslog';
 import { Logger } from 'tslog';
 
@@ -68,9 +68,10 @@ export class TransactionService {
     );
     const totalKwh = MeterValueUtils.getTotalKwh(meterValueTypes);
 
-    await Transaction.update(
-      { totalKwh: totalKwh },
-      { where: { id: transactionDbId }, returning: false },
+    await this._transactionEventRepository.updateTransactionTotalKwhById(
+      tenantId,
+      totalKwh,
+      transactionDbId,
     );
 
     this._logger.debug(`Recalculated ${totalKwh} kWh for ${transactionDbId} transaction`);

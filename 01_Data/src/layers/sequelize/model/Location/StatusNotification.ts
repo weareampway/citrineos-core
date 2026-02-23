@@ -82,11 +82,4 @@ export class StatusNotification extends Model implements StatusNotificationDto {
       instance.tenantId = DEFAULT_TENANT_ID;
     }
   }
-
-  constructor(...args: any[]) {
-    super(...args);
-    if (this.tenantId == null) {
-      this.tenantId = DEFAULT_TENANT_ID;
-    }
-  }
 }

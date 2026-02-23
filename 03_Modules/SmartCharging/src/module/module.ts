@@ -16,6 +16,8 @@ import {
   AsHandler,
   ChargingStationSequenceTypeEnum,
   EventGroup,
+  OCPP1_6,
+  OCPP1_6_CallAction,
   OCPP2_0_1,
   OCPP2_0_1_CallAction,
   OCPPVersion,
@@ -343,22 +345,21 @@ export class SmartChargingModule extends AbstractModule {
    * Handle responses
    */
 
-  @AsHandler(OCPPVersion.OCPP2_0_1, OCPP2_0_1_CallAction.ClearChargingProfile)
-  protected async _handleClearChargingProfile(
-    message: IMessage<OCPP2_0_1.ClearChargingProfileResponse>,
+  @AsHandler(OCPPVersion.OCPP1_6, OCPP1_6_CallAction.ClearChargingProfile)
+  protected async _handleClearChargingProfileOCPP1_6(
+    message: IMessage<OCPP1_6.ClearChargingProfileResponse>,
     props?: HandlerProperties,
   ): Promise<void> {
-    this._logger.debug('ClearChargingProfile response received:', message, props);
+    this._logger.debug('ClearChargingProfile (OCPP 1.6) response received:', message, props);
 
     const tenantId = message.context.tenantId;
-    if (message.payload.status === OCPP2_0_1.ClearChargingProfileStatusEnumType.Accepted) {
-      const stationId: string = message.context.stationId;
-      // Set existed profiles to isActive false
+    const stationId: string = message.context.stationId;
+    const status = message.payload.status;
+
+    if (status === OCPP1_6.ClearChargingProfileResponseStatus.Accepted) {
       await this._chargingProfileRepository.updateAllByQuery(
         tenantId,
-        {
-          isActive: false,
-        },
+        { isActive: false },
         {
           where: {
             tenantId: tenantId,
@@ -368,7 +369,83 @@ export class SmartChargingModule extends AbstractModule {
           returning: false,
         },
       );
-      // Request charging profiles to get the latest data
+    } else if (status === OCPP1_6.ClearChargingProfileResponseStatus.Unknown) {
+      this._logger.warn(
+        `Charging station returned Unknown for ClearChargingProfile (no matching profiles): ${JSON.stringify(message.payload)}`,
+      );
+    } else {
+      this._logger.error(`Failed to clear charging profile: ${JSON.stringify(message.payload)}`);
+    }
+  }
+
+  @AsHandler(OCPPVersion.OCPP1_6, OCPP1_6_CallAction.SetChargingProfile)
+  protected async _handleSetChargingProfileOCPP1_6(
+    message: IMessage<OCPP1_6.SetChargingProfileResponse>,
+    props?: HandlerProperties,
+  ): Promise<void> {
+    this._logger.debug('SetChargingProfile (OCPP 1.6) response received:', message, props);
+
+    const tenantId = message.context.tenantId;
+    const response: OCPP1_6.SetChargingProfileResponse = message.payload;
+
+    if (
+      response.status === OCPP1_6.SetChargingProfileResponseStatus.Rejected ||
+      response.status === OCPP1_6.SetChargingProfileResponseStatus.NotSupported
+    ) {
+      this._logger.error(`Failed to set charging profile: ${JSON.stringify(response)}`);
+    } else {
+      const stationId: string = message.context.stationId;
+      await this._chargingProfileRepository.updateAllByQuery(
+        tenantId,
+        { isActive: false },
+        {
+          where: {
+            tenantId: tenantId,
+            stationId: stationId,
+            isActive: true,
+          },
+          returning: false,
+        },
+      );
+    }
+  }
+
+  @AsHandler(OCPPVersion.OCPP2_0_1, OCPP2_0_1_CallAction.ClearChargingProfile)
+  protected async _handleClearChargingProfile(
+    message: IMessage<OCPP2_0_1.ClearChargingProfileResponse>,
+    props?: HandlerProperties,
+  ): Promise<void> {
+    this._logger.debug('ClearChargingProfile response received:', message, props);
+
+    const tenantId = message.context.tenantId;
+    const stationId: string = message.context.stationId;
+    const status = message.payload.status;
+
+    if (status === OCPP2_0_1.ClearChargingProfileStatusEnumType.Accepted) {
+      await this._chargingProfileRepository.updateAllByQuery(
+        tenantId,
+        { isActive: false },
+        {
+          where: {
+            tenantId: tenantId,
+            stationId: stationId,
+            isActive: true,
+          },
+          returning: false,
+        },
+      );
+    } else if (status === OCPP2_0_1.ClearChargingProfileStatusEnumType.Unknown) {
+      this._logger.warn(
+        `Charging station returned Unknown for ClearChargingProfile (no matching profiles): ${JSON.stringify(message.payload)}`,
+      );
+    } else {
+      this._logger.error(`Failed to clear charging profile: ${JSON.stringify(message.payload)}`);
+    }
+
+    if (
+      status === OCPP2_0_1.ClearChargingProfileStatusEnumType.Accepted ||
+      status === OCPP2_0_1.ClearChargingProfileStatusEnumType.Unknown
+    ) {
       await this.sendCall(
         stationId,
         message.context.tenantId,
@@ -390,8 +467,6 @@ export class SmartChargingModule extends AbstractModule {
           } as OCPP2_0_1.ChargingProfileCriterionType,
         } as OCPP2_0_1.GetChargingProfilesRequest,
       );
-    } else {
-      this._logger.error(`Failed to clear charging profile: ${JSON.stringify(message.payload)}`);
     }
   }
 
@@ -460,6 +535,48 @@ export class SmartChargingModule extends AbstractModule {
 
     const response: OCPP2_0_1.ClearedChargingLimitResponse = {};
     await this.sendCallResultWithMessage(message, response);
+  }
+
+  @AsHandler(OCPPVersion.OCPP1_6, OCPP1_6_CallAction.GetCompositeSchedule)
+  protected async _handleGetCompositeScheduleOCPP1_6(
+    message: IMessage<OCPP1_6.GetCompositeScheduleResponse>,
+    props?: HandlerProperties,
+  ): Promise<void> {
+    this._logger.debug('GetCompositeSchedule (OCPP 1.6) response received:', message, props);
+    const tenantId = message.context.tenantId;
+    const response = message.payload;
+    const chargingSchedule = response.chargingSchedule;
+    if (
+      response.status === OCPP1_6.GetCompositeScheduleResponseStatus.Accepted &&
+      chargingSchedule &&
+      chargingSchedule.chargingSchedulePeriod.length > 0
+    ) {
+      const periods = chargingSchedule.chargingSchedulePeriod.map(
+        (p) =>
+          ({
+            startPeriod: p.startPeriod,
+            limit: p.limit,
+            numberPhases: p.numberPhases,
+          }) as OCPP2_0_1.ChargingSchedulePeriodType,
+      );
+      const schedule: OCPP2_0_1.CompositeScheduleType = {
+        evseId: response.connectorId ?? 0,
+        duration: chargingSchedule.duration ?? 0,
+        scheduleStart:
+          response.scheduleStart ?? chargingSchedule.startSchedule ?? new Date().toISOString(),
+        chargingRateUnit:
+          chargingSchedule.chargingRateUnit ===
+          OCPP1_6.GetCompositeScheduleResponseChargingRateUnit.W
+            ? OCPP2_0_1.ChargingRateUnitEnumType.W
+            : OCPP2_0_1.ChargingRateUnitEnumType.A,
+        chargingSchedulePeriod: [periods[0], ...periods.slice(1)],
+      };
+      await this._chargingProfileRepository.createCompositeSchedule(
+        tenantId,
+        schedule,
+        message.context.stationId,
+      );
+    }
   }
 
   @AsHandler(OCPPVersion.OCPP2_0_1, OCPP2_0_1_CallAction.GetCompositeSchedule)

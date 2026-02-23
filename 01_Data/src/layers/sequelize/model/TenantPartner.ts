@@ -53,11 +53,4 @@ export class TenantPartner extends Model implements TenantPartnerDto {
       instance.tenantId = DEFAULT_TENANT_ID;
     }
   }
-
-  constructor(...args: any[]) {
-    super(...args);
-    if (this.tenantId == null) {
-      this.tenantId = DEFAULT_TENANT_ID;
-    }
-  }
 }
