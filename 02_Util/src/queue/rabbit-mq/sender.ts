@@ -13,6 +13,7 @@ import type {
 import { AbstractMessageSender, CircuitBreaker, MessageState, OcppError } from '@citrineos/base';
 import * as amqplib from 'amqplib';
 import { instanceToPlain } from 'class-transformer';
+import { getSharedChannel } from './shared-connection-pool.js';
 import type { ILogObj } from 'tslog';
 import { Logger } from 'tslog';
 
@@ -29,7 +30,6 @@ export class RabbitMqSender extends AbstractMessageSender implements IMessageSen
   /**
    * Fields
    */
-  protected _connection?: amqplib.Connection;
   protected _channel?: amqplib.Channel;
   private _reconnecting = false;
   private _abortReconnectController?: AbortController;
@@ -183,13 +183,12 @@ export class RabbitMqSender extends AbstractMessageSender implements IMessageSen
         throw new Error('Circuit breaker is CLOSED. Cannot connect to RabbitMQ.');
       }
       try {
-        const connection = await amqplib.connect(url);
-        this._connection = connection;
-        const channel = await connection.createChannel();
+        const channel = await getSharedChannel(url);
         channel.on('error', (err) => {
           this._logger.error('AMQP channel error', err);
+          this._handleDisconnect();
         });
-        this._setupConnectionListeners();
+        channel.on('close', () => this._handleDisconnect());
         this._circuitBreaker.triggerSuccess();
         return channel;
       } catch (err) {
@@ -275,30 +274,12 @@ export class RabbitMqSender extends AbstractMessageSender implements IMessageSen
   }
 
   /**
-   * Setup listeners for connection and channel events.
-   * This will handle disconnections and errors.
-   * Ensures listeners are not attached multiple times to the same connection.
-   */
-  private _setupConnectionListeners() {
-    if (this._connection) {
-      // Only attach listeners if not already attached to this connection
-      if ((this._connection as any)._listenersAttached) return;
-      this._connection.removeAllListeners('close');
-      this._connection.removeAllListeners('error');
-      this._connection.on('close', () => this._handleDisconnect());
-      this._connection.on('error', () => this._handleDisconnect());
-      (this._connection as any)._listenersAttached = true;
-    }
-  }
-
-  /**
    * Handle RabbitMQ disconnection.
    * This method will attempt to reconnect to RabbitMQ when the connection is lost.
    * Debounces concurrent reconnects.
    */
   private async _handleDisconnect() {
     this._logger.warn('RabbitMQ connection lost. Triggering circuit breaker failure.');
-    this._connection = undefined;
     this._channel = undefined;
     this._circuitBreaker.triggerFailure('RabbitMQ connection lost');
   }
