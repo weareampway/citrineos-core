@@ -200,6 +200,10 @@ export class MessageRouterImpl extends AbstractMessageRouter implements IMessage
     );
 
     const connectionIdentifier = createIdentifier(tenantId, stationId);
+    await Promise.allSettled([
+      this._cache.remove(connectionIdentifier, CacheNamespace.Connections),
+      this._cache.remove(connectionIdentifier, CacheNamespace.Transactions),
+    ]);
     // TODO: ensure that all queue implementations in 02_Util only unsubscribe 1 queue per call
     // ...which will require refactoring this method to unsubscribe request and response queues separately
     return await this._handler.unsubscribe(connectionIdentifier);
