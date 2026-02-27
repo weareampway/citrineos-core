@@ -29,7 +29,7 @@ export class RabbitMqReceiver extends AbstractMessageHandler {
   /**
    * Constants
    */
-  private static readonly QUEUE_PREFIX = 'rabbit_queue_';
+  private static readonly DEFAULT_QUEUE_PREFIX = 'rabbit_queue_';
   private static readonly CACHE_PREFIX = 'rabbit_subscription_';
   private static readonly RECONNECT_DELAY = 5000;
 
@@ -95,7 +95,9 @@ export class RabbitMqReceiver extends AbstractMessageHandler {
     }
 
     const exchange = this._config.util.messageBroker.amqp?.exchange as string;
-    const queueName = `${RabbitMqReceiver.QUEUE_PREFIX}${identifier}`;
+    const queuePrefix =
+      this._config.util.messageBroker.amqp?.queuePrefix ?? RabbitMqReceiver.DEFAULT_QUEUE_PREFIX;
+    const queueName = `${queuePrefix}${identifier}`;
 
     // Ensure that filter includes the x-match header set to all
     filter = filter
