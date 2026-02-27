@@ -20,6 +20,7 @@ export interface IMessageRouter extends IModule {
    */
   registerConnection(tenantId: number, stationId: string, protocol: string): Promise<boolean>;
   deregisterConnection(tenantId: number, stationId: string): Promise<boolean>;
+  deregisterLocalConnection(tenantId: number, stationId: string): Promise<boolean>;
 
   /**
    * Receive a message from the Network Connection.

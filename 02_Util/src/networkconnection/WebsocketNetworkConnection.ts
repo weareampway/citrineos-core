@@ -29,6 +29,8 @@ import type { ErrorEvent, MessageEvent } from 'ws';
 import { WebSocket, WebSocketServer } from 'ws';
 import type { IUpgradeError } from './authenticator/errors/IUpgradeError.js';
 
+type IWebsocketConnectionWithOwner = IWebsocketConnection & { instanceId?: string };
+
 export class WebsocketNetworkConnection implements INetworkConnection {
   protected _cache: ICache;
   protected _config: SystemConfig;
@@ -38,6 +40,7 @@ export class WebsocketNetworkConnection implements INetworkConnection {
   private _httpServersMap: Map<string, http.Server | https.Server>;
   private _authenticator: IAuthenticator;
   private _router: IMessageRouter;
+  private readonly _instanceId: string;
 
   constructor(
     config: SystemConfig,
@@ -54,6 +57,7 @@ export class WebsocketNetworkConnection implements INetworkConnection {
     this._authenticator = authenticator;
     router.networkHook = this.sendMessage.bind(this);
     this._router = router;
+    this._instanceId = process.env.HOSTNAME || `pid-${process.pid}`;
 
     this._httpServersMap = new Map<string, http.Server | https.Server>();
     this._config.util.networkConnection.websocketServers.forEach(async (websocketServerConfig) => {
@@ -72,33 +76,25 @@ export class WebsocketNetworkConnection implements INetworkConnection {
   sendMessage(identifier: string, message: string): Promise<void> {
     return new Promise<void>(async (resolve, reject) => {
       try {
-        const clientConnection = await this._cache.get(identifier, CacheNamespace.Connections);
-        if (clientConnection) {
-          const websocketConnection = this._identifierConnections.get(identifier);
-          if (websocketConnection && websocketConnection.readyState === WebSocket.OPEN) {
-            websocketConnection.send(message, (error) => {
-              if (error) {
-                reject(error); // Reject the promise with the error
-              } else {
-                resolve(); // Resolve the promise with true indicating success
-              }
-            });
-          } else {
-            const errorMsg = 'Websocket connection is not ready - ' + identifier;
-            this._logger.fatal(errorMsg);
-            websocketConnection?.close(1011, errorMsg);
-            reject(new Error(errorMsg)); // Reject with a new error
-          }
-        } else {
-          const errorMsg = 'Cannot identify client connection for ' + identifier;
-          // This can happen when a charging station disconnects in the moment a message is trying to send.
-          // Retry logic on the message sender might not suffice as charging station might connect to different instance.
-          this._logger.error(errorMsg);
-          this._identifierConnections
-            .get(identifier)
-            ?.close(1011, 'Failed to get connection information for ' + identifier);
-          reject(new Error(errorMsg)); // Reject with a new error
+        const websocketConnection = this._identifierConnections.get(identifier);
+        if (websocketConnection && websocketConnection.readyState === WebSocket.OPEN) {
+          websocketConnection.send(message, (error) => {
+            if (error) {
+              reject(error);
+            } else {
+              resolve();
+            }
+          });
+          return;
         }
+
+        const clientConnection = await this._cache.get(identifier, CacheNamespace.Connections);
+        const errorMsg = clientConnection
+          ? 'Websocket connection is not ready - ' + identifier
+          : 'Cannot identify client connection for ' + identifier;
+        this._logger.error(errorMsg);
+        websocketConnection?.close(1011, errorMsg);
+        reject(new Error(errorMsg));
       } catch (error) {
         reject(error);
       }
@@ -294,6 +290,13 @@ export class WebsocketNetworkConnection implements INetworkConnection {
       const tenantId = websocketServerConfig.tenantId;
       const identifier = createIdentifier(tenantId, stationId);
 
+      const existingConnection = this._identifierConnections.get(identifier);
+      if (existingConnection && existingConnection !== ws) {
+        this._logger.warn('Replacing existing websocket connection for identifier', identifier);
+        // Ensure stale sockets don't continue to emit messages for the same identifier.
+        existingConnection.close(1000, 'Superseded by a new websocket connection');
+      }
+
       this._identifierConnections.set(identifier, ws);
 
       try {
@@ -306,9 +309,10 @@ export class WebsocketNetworkConnection implements INetworkConnection {
         this._logger.info('Client websocket connected', identifier, ip, port, ws.protocol);
 
         // Register client
-        const websocketConnection: IWebsocketConnection = {
+        const websocketConnection = {
           id: websocketServerConfig.id,
           protocol: ws.protocol,
+          instanceId: this._instanceId,
         };
         let registered = await this._cache.set(
           identifier,
@@ -360,14 +364,7 @@ export class WebsocketNetworkConnection implements INetworkConnection {
     };
 
     ws.once('close', () => {
-      // Unregister client
-      this._logger.info('Connection closed for', identifier);
-      this._cache.remove(identifier, CacheNamespace.Connections);
-      this._identifierConnections.delete(identifier);
-      this._router.deregisterConnection(
-        getTenantIdFromIdentifier(identifier),
-        getStationIdFromIdentifier(identifier),
-      );
+      void this._cleanupClosedConnection(identifier, ws);
     });
 
     ws.on('ping', async (message) => {
@@ -383,8 +380,12 @@ export class WebsocketNetworkConnection implements INetworkConnection {
       );
 
       if (clientConnection) {
-        // Remove expiration for connection and send ping to client in pingInterval seconds.
-        await this._cache.set(identifier, clientConnection, CacheNamespace.Connections);
+        await this._cache.set(
+          identifier,
+          clientConnection,
+          CacheNamespace.Connections,
+          pingInterval * 2,
+        );
         this._ping(identifier, ws, pingInterval);
       } else {
         this._logger.debug('Pong received for', identifier, 'but client is not alive');
@@ -458,6 +459,54 @@ export class WebsocketNetworkConnection implements INetworkConnection {
         ws.close(1011, 'Client is not alive');
       }
     }, pingInterval * 1000);
+  }
+
+  private async _cleanupClosedConnection(identifier: string, ws: WebSocket): Promise<void> {
+    const activeConnection = this._identifierConnections.get(identifier);
+    if (activeConnection && activeConnection !== ws) {
+      this._logger.debug('Ignoring close event for stale websocket connection', identifier);
+      return;
+    }
+
+    this._identifierConnections.delete(identifier);
+    try {
+      const cachedConnection = await this._cache.get<string>(
+        identifier,
+        CacheNamespace.Connections,
+      );
+      let connectionInfo: IWebsocketConnectionWithOwner | null = null;
+      if (cachedConnection) {
+        try {
+          connectionInfo = JSON.parse(cachedConnection) as IWebsocketConnectionWithOwner;
+        } catch {
+          // Keep previous behavior if cache payload is malformed.
+        }
+      }
+
+      const ownsSharedConnection =
+        !connectionInfo?.instanceId || connectionInfo.instanceId === this._instanceId;
+      if (ownsSharedConnection) {
+        await this._cache.remove(identifier, CacheNamespace.Connections);
+        await this._router.deregisterConnection(
+          getTenantIdFromIdentifier(identifier),
+          getStationIdFromIdentifier(identifier),
+        );
+      } else {
+        this._logger.debug(
+          'Skipping shared connection cleanup from non-owning instance',
+          identifier,
+          connectionInfo?.instanceId ?? 'unknown',
+        );
+        await this._router.deregisterLocalConnection(
+          getTenantIdFromIdentifier(identifier),
+          getStationIdFromIdentifier(identifier),
+        );
+      }
+
+      this._logger.info('Connection closed for', identifier);
+    } catch (error) {
+      this._logger.error('Failed during websocket close cleanup for', identifier, error);
+    }
   }
   /**
    *

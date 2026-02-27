@@ -209,6 +209,11 @@ export class MessageRouterImpl extends AbstractMessageRouter implements IMessage
     return await this._handler.unsubscribe(connectionIdentifier);
   }
 
+  async deregisterLocalConnection(tenantId: number, stationId: string): Promise<boolean> {
+    const connectionIdentifier = createIdentifier(tenantId, stationId);
+    return await this._handler.unsubscribe(connectionIdentifier);
+  }
+
   async onMessage(
     identifier: string,
     message: string,

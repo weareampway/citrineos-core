@@ -38,6 +38,10 @@ export class RabbitMqReceiver extends AbstractMessageHandler {
    */
   protected _cache: ICache;
   protected _channel?: amqplib.Channel;
+  private _subscriptions = new Map<
+    string,
+    { actions?: CallAction[]; filter?: { [k: string]: string } }
+  >();
   private _abortReconnectController?: AbortController;
   private _circuitBreaker: CircuitBreaker;
   private _reconnectInterval?: NodeJS.Timeout;
@@ -94,54 +98,17 @@ export class RabbitMqReceiver extends AbstractMessageHandler {
       return true;
     }
 
-    const exchange = this._config.util.messageBroker.amqp?.exchange as string;
-    const queueName = `${RabbitMqReceiver.QUEUE_PREFIX}${identifier}`;
-
-    // Ensure that filter includes the x-match header set to all
-    filter = filter
-      ? {
-          'x-match': 'all',
-          ...filter,
-        }
-      : { 'x-match': 'all' };
-
     if (!this._channel) {
       throw new Error('RabbitMQ is down: cannot subscribe.');
     }
     const channel = this._channel;
+    const queueName = this._queueNameForSubscription(identifier, filter);
 
-    // Assert exchange and queue
-    await channel.assertExchange(exchange, 'headers', { durable: false });
-    await channel.assertQueue(queueName, {
-      durable: false,
-      autoDelete: true,
-      exclusive: false,
-    });
-
-    // Bind queue based on provided actions and filters
-    if (actions && actions.length > 0) {
-      for (const action of actions) {
-        this._logger.debug(
-          `Bind ${queueName} on ${exchange} for ${action} with filter ${JSON.stringify(filter)}.`,
-        );
-        await channel.bindQueue(queueName, exchange, '', { action, ...filter });
-        this._logger.info(
-          `Queue ${queueName} bound to exchange ${exchange} for action ${action} with filter ${JSON.stringify(filter)}.`,
-        );
-      }
-    } else {
-      this._logger.debug(`Bind ${queueName} on ${exchange} with filter ${JSON.stringify(filter)}.`);
-      await channel.bindQueue(queueName, exchange, '', filter);
-      this._logger.info(
-        `Queue ${queueName} bound to exchange ${exchange} with filter ${JSON.stringify(filter)}.`,
-      );
-    }
-
-    // Start consuming messages
-    await channel.consume(queueName, (msg) => this._onMessage(msg, channel));
+    await this._bindAndConsume(channel, identifier, actions, filter);
+    this._subscriptions.set(identifier, { actions, filter });
 
     // Define cache key
-    const cacheKey = `${RabbitMqReceiver.CACHE_PREFIX}${identifier}`;
+    const cacheKey = this._cacheKeyForSubscription(identifier);
 
     // Retrieve cached queue names
     const cachedQueues = await this._cache
@@ -161,7 +128,7 @@ export class RabbitMqReceiver extends AbstractMessageHandler {
   }
 
   unsubscribe(identifier: string): Promise<boolean> {
-    const cacheKey = `${RabbitMqReceiver.CACHE_PREFIX}${identifier}`;
+    const cacheKey = this._cacheKeyForSubscription(identifier);
     return this._cache
       .get<Array<string>>(cacheKey, CacheNamespace.Other, () => Array<string>)
       .then(async (queues) => {
@@ -184,11 +151,13 @@ export class RabbitMqReceiver extends AbstractMessageHandler {
           }
           // Remove the cache entry after successfully deleting all queues
           await this._cache.remove(cacheKey, CacheNamespace.Other);
+          this._subscriptions.delete(identifier);
           return true;
         } else {
           this._logger.warn(
             `Failed to delete queue for ${identifier}, queue name not found in cache.`,
           );
+          this._subscriptions.delete(identifier);
           return false;
         }
       });
@@ -230,6 +199,7 @@ export class RabbitMqReceiver extends AbstractMessageHandler {
           this._handleDisconnect();
         });
         channel.on('close', () => this._handleDisconnect());
+        await this._restoreSubscriptions(channel);
         this._circuitBreaker.triggerSuccess();
         return channel;
       } catch (err) {
@@ -327,6 +297,83 @@ export class RabbitMqReceiver extends AbstractMessageHandler {
     if (this._circuitBreaker.state === 'CLOSED') {
       this._startReconnectInterval();
     }
+  }
+
+  private async _restoreSubscriptions(channel: amqplib.Channel): Promise<void> {
+    if (this._subscriptions.size === 0) {
+      return;
+    }
+    this._logger.info(
+      `Restoring ${this._subscriptions.size} RabbitMQ subscriptions after reconnect`,
+    );
+    for (const [identifier, subscription] of this._subscriptions.entries()) {
+      await this._bindAndConsume(channel, identifier, subscription.actions, subscription.filter);
+    }
+  }
+
+  private async _bindAndConsume(
+    channel: amqplib.Channel,
+    identifier: string,
+    actions?: CallAction[],
+    filter?: { [k: string]: string },
+  ): Promise<void> {
+    const exchange = this._config.util.messageBroker.amqp?.exchange as string;
+    const queueName = this._queueNameForSubscription(identifier, filter);
+    const bindingFilter = filter
+      ? {
+          'x-match': 'all',
+          ...filter,
+        }
+      : { 'x-match': 'all' };
+
+    await channel.assertExchange(exchange, 'headers', { durable: false });
+    await channel.assertQueue(queueName, {
+      durable: false,
+      autoDelete: true,
+      exclusive: false,
+    });
+
+    if (actions && actions.length > 0) {
+      for (const action of actions) {
+        this._logger.debug(
+          `Bind ${queueName} on ${exchange} for ${action} with filter ${JSON.stringify(bindingFilter)}.`,
+        );
+        await channel.bindQueue(queueName, exchange, '', { action, ...bindingFilter });
+        this._logger.info(
+          `Queue ${queueName} bound to exchange ${exchange} for action ${action} with filter ${JSON.stringify(bindingFilter)}.`,
+        );
+      }
+    } else {
+      this._logger.debug(
+        `Bind ${queueName} on ${exchange} with filter ${JSON.stringify(bindingFilter)}.`,
+      );
+      await channel.bindQueue(queueName, exchange, '', bindingFilter);
+      this._logger.info(
+        `Queue ${queueName} bound to exchange ${exchange} with filter ${JSON.stringify(bindingFilter)}.`,
+      );
+    }
+
+    await channel.consume(queueName, (msg) => this._onMessage(msg, channel));
+  }
+
+  private _queueNameForSubscription(identifier: string, filter?: { [k: string]: string }): string {
+    const baseQueueName = `${RabbitMqReceiver.QUEUE_PREFIX}${identifier}`;
+    const isStationConnectionSubscription =
+      !!filter?.tenantId && !!filter?.stationId && filter?.origin === 'csms';
+
+    // Connection-scoped queues must be instance-local so one ECS task cannot consume
+    // another task's station-directed responses.
+    if (!isStationConnectionSubscription) {
+      return baseQueueName;
+    }
+
+    const instanceId = process.env.HOSTNAME || process.pid.toString();
+    return `${baseQueueName}_${instanceId}`;
+  }
+
+  private _cacheKeyForSubscription(identifier: string): string {
+    const instanceId = process.env.HOSTNAME || process.pid.toString();
+    return `${RabbitMqReceiver.CACHE_PREFIX}${identifier}_${instanceId}`;
   }
 
   /**
