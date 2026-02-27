@@ -61,6 +61,16 @@ const getZodSchemaKeyMap = (schema: z.ZodTypeAny): Record<string, any> => {
     );
   }
 
+  if (schema instanceof z.ZodUnion) {
+    return schema.options.reduce(
+      (acc, option) => {
+        const nested = getZodSchemaKeyMap(option as z.ZodTypeAny);
+        return { ...acc, ...nested };
+      },
+      {} as Record<string, any>,
+    );
+  }
+
   return {};
 };
 

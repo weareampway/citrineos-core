@@ -20,9 +20,11 @@ import { createClient } from 'redis';
 export class RedisCache implements ICache {
   private _client: RedisClientType<RedisModules, RedisFunctions, RedisScripts>;
   private _clientOptions?: RedisClientOptions;
+  private _namespacePrefix?: string;
 
-  constructor(clientOptions?: RedisClientOptions) {
+  constructor(clientOptions?: RedisClientOptions, namespacePrefix?: string) {
     this._clientOptions = clientOptions;
+    this._namespacePrefix = namespacePrefix;
     this._client = clientOptions ? createClient(clientOptions) : createClient();
     this._client.on('connect', () => console.log('Redis client connected'));
     this._client.on('ready', () => console.log('Redis client ready to use'));
@@ -37,14 +39,12 @@ export class RedisCache implements ICache {
   }
 
   exists(key: string, namespace?: string): Promise<boolean> {
-    namespace = namespace || 'default';
-    key = `${namespace}:${key}`;
+    key = this.prefixedKey(key, namespace);
     return this._client.exists(key).then((result) => result === 1);
   }
 
   remove(key: string, namespace?: string | undefined): Promise<boolean> {
-    namespace = namespace || 'default';
-    key = `${namespace}:${key}`;
+    key = this.prefixedKey(key, namespace);
     return this._client.del(key).then((result) => result === 1);
   }
 
@@ -54,8 +54,7 @@ export class RedisCache implements ICache {
     namespace?: string | undefined,
     classConstructor?: (() => ClassConstructor<T>) | undefined,
   ): Promise<T | null> {
-    namespace = namespace || 'default';
-    const namespaceKey = `${namespace}:${key}`;
+    const namespaceKey = this.prefixedKey(key, namespace);
     const channel = `__keyspace@0__:${namespaceKey}`;
 
     return new Promise((resolve) => {
@@ -118,8 +117,7 @@ export class RedisCache implements ICache {
     namespace?: string,
     classConstructor?: () => ClassConstructor<T>,
   ): Promise<T | null> {
-    namespace = namespace || 'default';
-    key = `${namespace}:${key}`;
+    key = this.prefixedKey(key, namespace);
     return this._client.get(key).then((result) => {
       if (result) {
         if (classConstructor) {
@@ -132,8 +130,7 @@ export class RedisCache implements ICache {
   }
 
   set(key: string, value: string, namespace?: string, expireSeconds?: number): Promise<boolean> {
-    namespace = namespace || 'default';
-    key = `${namespace}:${key}`;
+    key = this.prefixedKey(key, namespace);
     const setOptions = expireSeconds ? { EX: expireSeconds } : undefined;
     return this._client.set(key, value, setOptions).then((result) => {
       if (result) {
@@ -149,8 +146,7 @@ export class RedisCache implements ICache {
     namespace?: string,
     expireSeconds?: number,
   ): Promise<boolean> {
-    namespace = namespace || 'default';
-    key = `${namespace}:${key}`;
+    key = this.prefixedKey(key, namespace);
     return this._client
       .set(key, value, expireSeconds ? { EX: expireSeconds, NX: true } : { NX: true })
       .then((result) => {
@@ -159,5 +155,14 @@ export class RedisCache implements ICache {
         }
         return false;
       });
+  }
+
+  private prefixedKey(key: string, namespace?: string): string {
+    const resolvedNamespace = namespace || 'default';
+    const namespaceKey = `${resolvedNamespace}:${key}`;
+    if (!this._namespacePrefix) {
+      return namespaceKey;
+    }
+    return `${this._namespacePrefix}:${namespaceKey}`;
   }
 }

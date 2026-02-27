@@ -324,6 +324,7 @@ export class CitrineOSServer {
   private initCache(cache?: ICache): ICache {
     if (cache) return cache;
     if (this._config.util.cache.redis) {
+      const { namespacePrefix } = this._config.util.cache.redis;
       const redisClientOptions: RedisClientOptions =
         'url' in this._config.util.cache.redis
           ? { url: this._config.util.cache.redis.url }
@@ -333,7 +334,7 @@ export class CitrineOSServer {
                 port: this._config.util.cache.redis.port,
               },
             };
-      return new RedisCache(redisClientOptions);
+      return new RedisCache(redisClientOptions, namespacePrefix);
     }
     return new MemoryCache();
   }
