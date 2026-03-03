@@ -283,23 +283,26 @@ export class RabbitMqReceiver extends AbstractMessageHandler {
         break;
       }
       case 'OPEN': {
-        this._logger.info(
-          'Circuit breaker is OPEN. Will attempt to (re)initialize RabbitMQ connection.',
-        );
+        this._logger.info('Circuit breaker is OPEN.');
         if (this._reconnectInterval) {
           this._logger.info('Clearing reconnect interval as circuit breaker is now OPEN.');
           clearInterval(this._reconnectInterval);
           this._reconnectInterval = undefined;
         }
-        this._connectWithRetry()
-          .then((channel) => {
-            this._logger.info('RabbitMQ connection (re)initialized.');
-            this._channel = channel;
-            this._circuitBreaker.triggerSuccess();
-          })
-          .catch((err) => {
-            this._logger.error('RabbitMQ (re)init failed.', err);
-          });
+        if (!this._channel) {
+          this._logger.info(
+            'RabbitMQ channel missing while OPEN. Attempting to (re)initialize connection.',
+          );
+          this._connectWithRetry()
+            .then((channel) => {
+              this._logger.info('RabbitMQ connection (re)initialized.');
+              this._channel = channel;
+              this._circuitBreaker.triggerSuccess();
+            })
+            .catch((err) => {
+              this._logger.error('RabbitMQ (re)init failed.', err);
+            });
+        }
         break;
       }
       case 'FAILING': {
