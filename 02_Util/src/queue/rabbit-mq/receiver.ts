@@ -25,6 +25,12 @@ import { MemoryCache } from '../../index.js';
 /**
  * Implementation of a {@link IMessageHandler} using RabbitMQ as the underlying transport.
  */
+type SubscriptionRegistration = {
+  identifier: string;
+  actions?: CallAction[];
+  filter?: { [k: string]: string };
+};
+
 export class RabbitMqReceiver extends AbstractMessageHandler {
   /**
    * Constants
@@ -41,6 +47,7 @@ export class RabbitMqReceiver extends AbstractMessageHandler {
   private _abortReconnectController?: AbortController;
   private _circuitBreaker: CircuitBreaker;
   private _reconnectInterval?: NodeJS.Timeout;
+  private _subscriptionRegistry: SubscriptionRegistration[] = [];
 
   constructor(
     config: SystemConfig,
@@ -61,6 +68,7 @@ export class RabbitMqReceiver extends AbstractMessageHandler {
     }
     this._abortReconnectController = new AbortController();
     this._channel = await this._connectWithRetry(this._abortReconnectController.signal);
+    await this._resubscribeAll();
   }
 
   /**
@@ -94,75 +102,17 @@ export class RabbitMqReceiver extends AbstractMessageHandler {
       return true;
     }
 
-    const exchange = this._config.util.messageBroker.amqp?.exchange as string;
-    const queuePrefix =
-      this._config.util.messageBroker.amqp?.queuePrefix ?? RabbitMqReceiver.DEFAULT_QUEUE_PREFIX;
-    const queueName = `${queuePrefix}${identifier}`;
-
-    // Ensure that filter includes the x-match header set to all
-    filter = filter
-      ? {
-          'x-match': 'all',
-          ...filter,
-        }
-      : { 'x-match': 'all' };
-
-    if (!this._channel) {
-      throw new Error('RabbitMQ is down: cannot subscribe.');
+    const ok = await this._performSubscribe(identifier, actions, filter);
+    if (ok) {
+      this._subscriptionRegistry.push({ identifier, actions, filter });
     }
-    const channel = this._channel;
-
-    // Assert exchange and queue
-    await channel.assertExchange(exchange, 'headers', { durable: false });
-    await channel.assertQueue(queueName, {
-      durable: false,
-      autoDelete: true,
-      exclusive: false,
-    });
-
-    // Bind queue based on provided actions and filters
-    if (actions && actions.length > 0) {
-      for (const action of actions) {
-        this._logger.debug(
-          `Bind ${queueName} on ${exchange} for ${action} with filter ${JSON.stringify(filter)}.`,
-        );
-        await channel.bindQueue(queueName, exchange, '', { action, ...filter });
-        this._logger.info(
-          `Queue ${queueName} bound to exchange ${exchange} for action ${action} with filter ${JSON.stringify(filter)}.`,
-        );
-      }
-    } else {
-      this._logger.debug(`Bind ${queueName} on ${exchange} with filter ${JSON.stringify(filter)}.`);
-      await channel.bindQueue(queueName, exchange, '', filter);
-      this._logger.info(
-        `Queue ${queueName} bound to exchange ${exchange} with filter ${JSON.stringify(filter)}.`,
-      );
-    }
-
-    // Start consuming messages
-    await channel.consume(queueName, (msg) => this._onMessage(msg, channel));
-
-    // Define cache key
-    const cacheKey = `${RabbitMqReceiver.CACHE_PREFIX}${identifier}`;
-
-    // Retrieve cached queue names
-    const cachedQueues = await this._cache
-      .get<Array<string>>(cacheKey, CacheNamespace.Other, () => Array<string>)
-      .then((value) => {
-        if (value) {
-          value.push(queueName);
-          return value;
-        }
-        return new Array<string>(queueName);
-      });
-
-    // Add queue name to cache
-    await this._cache.set(cacheKey, JSON.stringify(cachedQueues), CacheNamespace.Other);
-
-    return true;
+    return ok;
   }
 
   unsubscribe(identifier: string): Promise<boolean> {
+    this._subscriptionRegistry = this._subscriptionRegistry.filter(
+      (s) => s.identifier !== identifier,
+    );
     const cacheKey = `${RabbitMqReceiver.CACHE_PREFIX}${identifier}`;
     return this._cache
       .get<Array<string>>(cacheKey, CacheNamespace.Other, () => Array<string>)
@@ -198,6 +148,7 @@ export class RabbitMqReceiver extends AbstractMessageHandler {
 
   shutdown(): Promise<void> {
     this._abortReconnectController?.abort();
+    this._subscriptionRegistry = [];
     return Promise.resolve();
   }
 
@@ -243,97 +194,6 @@ export class RabbitMqReceiver extends AbstractMessageHandler {
     }
   }
 
-  private _startReconnectInterval() {
-    if (this._reconnectInterval) {
-      clearInterval(this._reconnectInterval);
-    }
-    const delay = (this._config.maxReconnectDelay || 30) * 1000;
-    this._logger.warn(
-      `Starting continuous reconnect attempts every ${delay / 1000} seconds while circuit breaker is CLOSED.`,
-    );
-    this._reconnectInterval = setInterval(() => {
-      this._logger.info('Attempting RabbitMQ reconnect due to circuit breaker CLOSED...');
-      this._connectWithRetry()
-        .then((channel) => {
-          this._logger.info('RabbitMQ reconnect attempt succeeded.');
-          this._channel = channel;
-          this._circuitBreaker.triggerSuccess();
-        })
-        .catch((err) => {
-          this._logger.error('RabbitMQ reconnect attempt failed.', err);
-        });
-    }, delay);
-  }
-
-  private _onCircuitBreakerStateChange(state: CircuitBreakerState, reason?: string) {
-    this._logger.info(`[CircuitBreaker] State changed to ${state}${reason ? `: ${reason}` : ''}`);
-
-    switch (state) {
-      case 'CLOSED': {
-        this._logger.error(
-          'Circuit breaker CLOSED: shutting down RabbitMQ receiver. Reason:',
-          reason,
-        );
-        void this.shutdown();
-        if (this._reconnectInterval) {
-          this._logger.info('Clearing reconnect interval as circuit breaker is now CLOSED.');
-          clearInterval(this._reconnectInterval);
-          this._reconnectInterval = undefined;
-        }
-        break;
-      }
-      case 'OPEN': {
-        this._logger.info('Circuit breaker is OPEN.');
-        if (this._reconnectInterval) {
-          this._logger.info('Clearing reconnect interval as circuit breaker is now OPEN.');
-          clearInterval(this._reconnectInterval);
-          this._reconnectInterval = undefined;
-        }
-        if (!this._channel) {
-          this._logger.info(
-            'RabbitMQ channel missing while OPEN. Attempting to (re)initialize connection.',
-          );
-          this._connectWithRetry()
-            .then((channel) => {
-              this._logger.info('RabbitMQ connection (re)initialized.');
-              this._channel = channel;
-              this._circuitBreaker.triggerSuccess();
-            })
-            .catch((err) => {
-              this._logger.error('RabbitMQ (re)init failed.', err);
-            });
-        }
-        break;
-      }
-      case 'FAILING': {
-        this._logger.warn(
-          'Circuit breaker is FAILING. RabbitMQ receiver will not receive messages until recovery. Reason:',
-          reason,
-        );
-        this._logger.info('Attempting to start reconnect interval after circuit breaker FAILING.');
-        this._startReconnectInterval();
-        break;
-      }
-      default:
-        this._logger.warn('Unknown circuit breaker state:', state);
-        break;
-    }
-  }
-
-  /**
-   * Handle RabbitMQ disconnection.
-   * This method will attempt to reconnect to RabbitMQ when the connection is lost.
-   * Debounces concurrent reconnects.
-   */
-  private async _handleDisconnect() {
-    this._logger.warn('RabbitMQ connection lost. Triggering circuit breaker failure.');
-    this._channel = undefined;
-    this._circuitBreaker.triggerFailure('RabbitMQ connection lost');
-    if (this._circuitBreaker.state === 'CLOSED') {
-      this._startReconnectInterval();
-    }
-  }
-
   /**
    * Underlying RabbitMQ message handler.
    *
@@ -375,6 +235,192 @@ export class RabbitMqReceiver extends AbstractMessageHandler {
         }
       }
       channel.ack(message);
+    }
+  }
+
+  private _startReconnectInterval() {
+    if (this._reconnectInterval) {
+      clearInterval(this._reconnectInterval);
+    }
+    const delay = (this._config.maxReconnectDelay || 30) * 1000;
+    this._logger.warn(
+      `Starting continuous reconnect attempts every ${delay / 1000} seconds while circuit breaker is CLOSED.`,
+    );
+    this._reconnectInterval = setInterval(() => {
+      this._logger.info('Attempting RabbitMQ reconnect due to circuit breaker CLOSED...');
+      this._connectWithRetry()
+        .then(async (channel) => {
+          this._logger.info('RabbitMQ reconnect attempt succeeded.');
+          this._channel = channel;
+          await this._resubscribeAll();
+          this._circuitBreaker.triggerSuccess();
+        })
+        .catch((err) => {
+          this._logger.error('RabbitMQ reconnect attempt failed.', err);
+        });
+    }, delay);
+  }
+
+  private _onCircuitBreakerStateChange(state: CircuitBreakerState, reason?: string) {
+    this._logger.info(`[CircuitBreaker] State changed to ${state}${reason ? `: ${reason}` : ''}`);
+
+    switch (state) {
+      case 'CLOSED': {
+        this._logger.error(
+          'Circuit breaker CLOSED: shutting down RabbitMQ receiver. Reason:',
+          reason,
+        );
+        void this.shutdown();
+        if (this._reconnectInterval) {
+          this._logger.info('Clearing reconnect interval as circuit breaker is now CLOSED.');
+          clearInterval(this._reconnectInterval);
+          this._reconnectInterval = undefined;
+        }
+        break;
+      }
+      case 'OPEN': {
+        this._logger.info('Circuit breaker is OPEN.');
+        if (this._reconnectInterval) {
+          this._logger.info('Clearing reconnect interval as circuit breaker is now OPEN.');
+          clearInterval(this._reconnectInterval);
+          this._reconnectInterval = undefined;
+        }
+        if (!this._channel) {
+          this._logger.info(
+            'RabbitMQ channel missing while OPEN. Attempting to (re)initialize connection.',
+          );
+          this._connectWithRetry()
+            .then(async (channel) => {
+              this._logger.info('RabbitMQ connection (re)initialized.');
+              this._channel = channel;
+              await this._resubscribeAll();
+              this._circuitBreaker.triggerSuccess();
+            })
+            .catch((err) => {
+              this._logger.error('RabbitMQ (re)init failed.', err);
+            });
+        }
+        break;
+      }
+      case 'FAILING': {
+        this._logger.warn(
+          'Circuit breaker is FAILING. RabbitMQ receiver will not receive messages until recovery. Reason:',
+          reason,
+        );
+        this._logger.info('Attempting to start reconnect interval after circuit breaker FAILING.');
+        this._startReconnectInterval();
+        break;
+      }
+      default:
+        this._logger.warn('Unknown circuit breaker state:', state);
+        break;
+    }
+  }
+
+  /**
+   * Handle RabbitMQ disconnection.
+   * This method will attempt to reconnect to RabbitMQ when the connection is lost.
+   * Debounces concurrent reconnects.
+   */
+  private async _handleDisconnect() {
+    this._logger.warn('RabbitMQ connection lost. Triggering circuit breaker failure.');
+    this._channel = undefined;
+    this._circuitBreaker.triggerFailure('RabbitMQ connection lost');
+    if (this._circuitBreaker.state === 'CLOSED') {
+      this._startReconnectInterval();
+    }
+  }
+
+  private async _performSubscribe(
+    identifier: string,
+    actions?: CallAction[],
+    filter?: { [k: string]: string },
+  ): Promise<boolean> {
+    const exchange = this._config.util.messageBroker.amqp?.exchange as string;
+    const queuePrefix =
+      (this._config.util.messageBroker.amqp as { queuePrefix?: string } | undefined)?.queuePrefix ??
+      RabbitMqReceiver.DEFAULT_QUEUE_PREFIX;
+    const queueName = `${queuePrefix}${identifier}`;
+
+    const filterWithMatch = filter
+      ? {
+          'x-match': 'all',
+          ...filter,
+        }
+      : { 'x-match': 'all' };
+
+    if (!this._channel) {
+      throw new Error('RabbitMQ is down: cannot subscribe.');
+    }
+    const channel = this._channel;
+
+    await channel.assertExchange(exchange, 'headers', { durable: false });
+    await channel.assertQueue(queueName, {
+      durable: false,
+      autoDelete: true,
+      exclusive: false,
+    });
+
+    if (actions && actions.length > 0) {
+      for (const action of actions) {
+        this._logger.debug(
+          `Bind ${queueName} on ${exchange} for ${action} with filter ${JSON.stringify(filterWithMatch)}.`,
+        );
+        await channel.bindQueue(queueName, exchange, '', { action, ...filterWithMatch });
+        this._logger.info(
+          `Queue ${queueName} bound to exchange ${exchange} for action ${action} with filter ${JSON.stringify(filterWithMatch)}.`,
+        );
+      }
+    } else {
+      this._logger.debug(
+        `Bind ${queueName} on ${exchange} with filter ${JSON.stringify(filterWithMatch)}.`,
+      );
+      await channel.bindQueue(queueName, exchange, '', filterWithMatch);
+      this._logger.info(
+        `Queue ${queueName} bound to exchange ${exchange} with filter ${JSON.stringify(filterWithMatch)}.`,
+      );
+    }
+
+    await channel.consume(queueName, (msg) => this._onMessage(msg, channel));
+
+    const cacheKey = `${RabbitMqReceiver.CACHE_PREFIX}${identifier}`;
+
+    const cachedQueues = await this._cache
+      .get<Array<string>>(cacheKey, CacheNamespace.Other, () => Array<string>)
+      .then((value) => {
+        if (value) {
+          value.push(queueName);
+          return value;
+        }
+        return new Array<string>(queueName);
+      });
+
+    await this._cache.set(cacheKey, JSON.stringify(cachedQueues), CacheNamespace.Other);
+
+    return true;
+  }
+
+  private async _resubscribeAll(): Promise<void> {
+    if (!this._channel || this._subscriptionRegistry.length === 0) {
+      return;
+    }
+    this._logger.info(
+      `Resubscribing ${this._subscriptionRegistry.length} RabbitMQ subscription(s) after reconnect`,
+    );
+    const uniqueIds = new Set(this._subscriptionRegistry.map((s) => s.identifier));
+    for (const id of uniqueIds) {
+      const cacheKey = `${RabbitMqReceiver.CACHE_PREFIX}${id}`;
+      await this._cache.remove(cacheKey, CacheNamespace.Other);
+    }
+    for (const sub of this._subscriptionRegistry) {
+      try {
+        await this._performSubscribe(sub.identifier, sub.actions, sub.filter);
+      } catch (err) {
+        this._logger.error(
+          `Failed to resubscribe RabbitMQ queue for ${sub.identifier}; messaging may be broken until reconnect.`,
+          err,
+        );
+      }
     }
   }
 }
