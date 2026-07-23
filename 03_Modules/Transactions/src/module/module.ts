@@ -572,7 +572,7 @@ export class TransactionsModule extends AbstractModule {
     const transactionId = message.payload.transactionId;
     const meterValues = message.payload.meterValue;
 
-    if (connectorId !== 0 && transactionId && meterValues.length > 0) {
+    if (connectorId !== 0 && transactionId != null && meterValues.length > 0) {
       try {
         const meterValueEntities: MeterValue[] = [];
         for (const meterValue of meterValues) {
