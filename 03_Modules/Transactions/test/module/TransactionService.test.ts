@@ -220,12 +220,12 @@ describe('TransactionService', () => {
 
       // Use the same idToken as the mock authorization
       const messageContext = aMessageContext();
-      const connectorId = 1;
-      const response = await transactionService.authorizeOcpp16IdToken(
-        messageContext,
-        authorization.idToken,
-        connectorId,
-      );
+      const response = await transactionService.authorizeOcpp16IdToken(messageContext, {
+        connectorId: 1,
+        idTag: authorization.idToken,
+        meterStart: 0,
+        timestamp: new Date().toISOString(),
+      });
 
       expect(response.idTagInfo.status).toBe(OCPP1_6.StartTransactionResponseStatus.Accepted);
       expect(response.idTagInfo.parentIdTag).toBe(authorization.groupAuthorizationId);
@@ -239,12 +239,12 @@ describe('TransactionService', () => {
       authorizationRepository.readAllByQuerystring.mockResolvedValue([authorization]);
 
       const messageContext = aMessageContext();
-      const connectorId = 1;
-      const response = await transactionService.authorizeOcpp16IdToken(
-        messageContext,
-        faker.string.uuid(),
-        connectorId,
-      );
+      const response = await transactionService.authorizeOcpp16IdToken(messageContext, {
+        connectorId: 1,
+        idTag: faker.string.uuid(),
+        meterStart: 0,
+        timestamp: new Date().toISOString(),
+      });
 
       expect(response.idTagInfo.status).toBe(OCPP1_6.StartTransactionResponseStatus.Blocked);
       expect(response.idTagInfo.parentIdTag).toBeUndefined();
@@ -258,12 +258,12 @@ describe('TransactionService', () => {
       authorizationRepository.readAllByQuerystring.mockResolvedValue([authorization]);
 
       const messageContext = aMessageContext();
-      const connectorId = 1;
-      const response = await transactionService.authorizeOcpp16IdToken(
-        messageContext,
-        faker.string.uuid(),
-        connectorId,
-      );
+      const response = await transactionService.authorizeOcpp16IdToken(messageContext, {
+        connectorId: 1,
+        idTag: faker.string.uuid(),
+        meterStart: 0,
+        timestamp: new Date().toISOString(),
+      });
 
       expect(response.idTagInfo.status).toBe(OCPP1_6.StartTransactionResponseStatus.Expired);
       expect(response.idTagInfo.parentIdTag).toBeUndefined();
@@ -278,16 +278,38 @@ describe('TransactionService', () => {
       ]);
 
       const messageContext = aMessageContext();
-      const connectorId = 1;
-      const response = await transactionService.authorizeOcpp16IdToken(
-        messageContext,
-        faker.string.uuid(),
-        connectorId,
-      );
+      const response = await transactionService.authorizeOcpp16IdToken(messageContext, {
+        connectorId: 1,
+        idTag: faker.string.uuid(),
+        meterStart: 0,
+        timestamp: new Date().toISOString(),
+      });
 
       expect(response.idTagInfo.status).toBe(OCPP1_6.StartTransactionResponseStatus.ConcurrentTx);
       expect(response.idTagInfo.parentIdTag).toBeUndefined();
       expect(response.idTagInfo.expiryDate).toBeUndefined();
+    });
+
+    it('should accept a re-announced active transaction (reconnect) with its existing transactionId', async () => {
+      const authorization = anAuthorization();
+      authorizationRepository.readAllByQuerystring.mockResolvedValue([authorization]);
+      const timestamp = '2026-07-06T12:36:37.000Z';
+      transactionEventRepository.readAllActiveTransactionsByAuthorizationId.mockResolvedValue([
+        aTransaction((transaction) => {
+          transaction.startTime = timestamp;
+          transaction.transactionId = '42';
+        }),
+      ]);
+
+      const response = await transactionService.authorizeOcpp16IdToken(aMessageContext(), {
+        connectorId: 1,
+        idTag: authorization.idToken,
+        meterStart: 14003,
+        timestamp,
+      });
+
+      expect(response.idTagInfo.status).toBe(OCPP1_6.StartTransactionResponseStatus.Accepted);
+      expect(response.transactionId).toBe(42);
     });
   });
 });

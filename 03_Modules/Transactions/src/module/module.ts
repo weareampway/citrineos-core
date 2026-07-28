@@ -615,12 +615,15 @@ export class TransactionsModule extends AbstractModule {
     // Authorize
     const response = await this._transactionService.authorizeOcpp16IdToken(
       message.context,
-      request.idTag,
-      request.connectorId,
+      request,
     );
 
     // Send response to charger
     if (response.idTagInfo.status !== OCPP1_6.StartTransactionResponseStatus.Accepted) {
+      await this.sendCallResultWithMessage(message, response);
+    } else if (response.transactionId !== 0) {
+      // Re-announcement of an already-active transaction: authorizeOcpp16IdToken resolved the existing
+      // transactionId, so do not create a duplicate — just acknowledge with it.
       await this.sendCallResultWithMessage(message, response);
     } else {
       try {

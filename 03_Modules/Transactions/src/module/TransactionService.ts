@@ -187,9 +187,10 @@ export class TransactionService {
 
   async authorizeOcpp16IdToken(
     context: IMessageContext,
-    idToken: string,
-    connectorId: number,
+    request: OCPP1_6.StartTransactionRequest,
   ): Promise<OCPP1_6.StartTransactionResponse> {
+    const idToken = request.idTag;
+    const connectorId = request.connectorId;
     const response: OCPP1_6.StartTransactionResponse = {
       idTagInfo: {
         status: OCPP1_6.StartTransactionResponseStatus.Invalid,
@@ -234,8 +235,27 @@ export class TransactionService {
       }
 
       // Check concurrent transactions
-      const hasConcurrent = await this._hasConcurrentTransactions(tenantId, authorization.id);
-      if (hasConcurrent) {
+      const activeTransactions =
+        await this._transactionEventRepository.readAllActiveTransactionsByAuthorizationId(
+          tenantId,
+          authorization.id,
+        );
+      if (activeTransactions.length > 0) {
+        // A charge point that reconnects re-sends the StartTransaction for its ongoing session (a queued
+        // transaction message). Match it to an existing active transaction by start time; if it is the
+        // same session, respond idempotently with its transactionId + Accepted. Returning ConcurrentTx
+        // here makes the charger treat the running session as DeAuthorized and stop a live charge
+        // (observed on Mennekes AMTRON after a websocket reconnect).
+        const reannouncedTransaction = activeTransactions.find(
+          (transaction) =>
+            transaction.startTime !== undefined &&
+            new Date(transaction.startTime).getTime() === new Date(request.timestamp).getTime(),
+        );
+        if (reannouncedTransaction) {
+          response.idTagInfo.status = OCPP1_6.StartTransactionResponseStatus.Accepted;
+          response.transactionId = parseInt(reannouncedTransaction.transactionId);
+          return response;
+        }
         response.idTagInfo.status = OCPP1_6.StartTransactionResponseStatus.ConcurrentTx;
         return response;
       }
