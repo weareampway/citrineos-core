@@ -294,7 +294,11 @@ export class WebsocketNetworkConnection implements INetworkConnection {
       const tenantId = websocketServerConfig.tenantId;
       const identifier = createIdentifier(tenantId, stationId);
 
+      const existing = this._identifierConnections.get(identifier);
       this._identifierConnections.set(identifier, ws);
+      if (existing && existing !== ws) {
+        existing.terminate();
+      }
 
       try {
         // Get IP address of client
@@ -360,8 +364,10 @@ export class WebsocketNetworkConnection implements INetworkConnection {
     };
 
     ws.once('close', () => {
-      // Unregister client
       this._logger.info('Connection closed for', identifier);
+      if (this._identifierConnections.get(identifier) !== ws) {
+        return;
+      }
       this._cache.remove(identifier, CacheNamespace.Connections);
       this._identifierConnections.delete(identifier);
       this._router.deregisterConnection(
@@ -371,23 +377,26 @@ export class WebsocketNetworkConnection implements INetworkConnection {
     });
 
     ws.on('ping', async (message) => {
-      this._logger.debug(`Ping received for ${identifier} with message ${JSON.stringify(message)}`);
+      this._logger.trace(`Ping received for ${identifier} with message ${JSON.stringify(message)}`);
       ws.pong(message);
     });
 
     ws.on('pong', async () => {
-      this._logger.debug('Pong received for', identifier);
+      this._logger.trace('Pong received for', identifier);
+      if (this._identifierConnections.get(identifier) !== ws) {
+        ws.terminate();
+        return;
+      }
       const clientConnection: string | null = await this._cache.get(
         identifier,
         CacheNamespace.Connections,
       );
 
       if (clientConnection) {
-        // Remove expiration for connection and send ping to client in pingInterval seconds.
         await this._cache.set(identifier, clientConnection, CacheNamespace.Connections);
         this._ping(identifier, ws, pingInterval);
       } else {
-        this._logger.debug('Pong received for', identifier, 'but client is not alive');
+        this._logger.trace('Pong received for', identifier, 'but client is not alive');
         ws.close(1011, 'Client is not alive');
       }
     });
@@ -440,13 +449,15 @@ export class WebsocketNetworkConnection implements INetworkConnection {
    */
   private async _ping(identifier: string, ws: WebSocket, pingInterval: number): Promise<void> {
     setTimeout(async () => {
+      if (this._identifierConnections.get(identifier) !== ws || ws.readyState !== WebSocket.OPEN) {
+        return;
+      }
       const clientConnection: string | null = await this._cache.get(
         identifier,
         CacheNamespace.Connections,
       );
       if (clientConnection) {
-        this._logger.debug('Pinging client', identifier);
-        // Set connection expiration and send ping to client
+        this._logger.trace('Pinging client', identifier);
         await this._cache.set(
           identifier,
           clientConnection,
