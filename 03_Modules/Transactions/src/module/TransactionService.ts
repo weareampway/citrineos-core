@@ -256,8 +256,21 @@ export class TransactionService {
           response.transactionId = parseInt(reannouncedTransaction.transactionId);
           return response;
         }
-        response.idTagInfo.status = OCPP1_6.StartTransactionResponseStatus.ConcurrentTx;
-        return response;
+
+        // A station-local token (IdTokenEnumType 'Local') is shared by design: it is configured on the
+        // charge point itself for sites that hand out no cards, so every connector announces the same
+        // one and genuinely parallel sessions are the normal case. Rejecting the second connector with
+        // ConcurrentTx answered it with the placeholder transactionId 0, which made concurrent sessions
+        // indistinguishable from each other (#212).
+        //
+        // Deliberately narrow: for every other token type the single-session restriction stays as it is.
+        // Whether OCPP 1.6 should honour `concurrentTransaction` the way the 2.0.1 path above does - and
+        // thereby drop the restriction for all tokens, since the column defaults to false - is a separate
+        // decision and not made here.
+        if (authorization.idTokenType !== OCPP2_0_1.IdTokenEnumType.Local) {
+          response.idTagInfo.status = OCPP1_6.StartTransactionResponseStatus.ConcurrentTx;
+          return response;
+        }
       }
 
       // Check authorizers
