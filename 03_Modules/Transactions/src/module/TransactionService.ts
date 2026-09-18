@@ -11,6 +11,7 @@ import type {
 } from '@citrineos/base';
 import {
   AuthorizationStatusEnum,
+  IdTokenEnum,
   MessageOrigin,
   MeterValueUtils,
   OCPP1_6,
@@ -234,38 +235,40 @@ export class TransactionService {
         return response;
       }
 
-      // Check concurrent transactions
+      const connector = await this._locationRepository.readConnectorByStationIdAndOcpp16ConnectorId(
+        tenantId,
+        context.stationId,
+        connectorId,
+      );
+
       const activeTransactions =
         await this._transactionEventRepository.readAllActiveTransactionsByAuthorizationId(
           tenantId,
           authorization.id,
         );
       if (activeTransactions.length > 0) {
-        // A charge point that reconnects re-sends the StartTransaction for its ongoing session (a queued
-        // transaction message). Match it to an existing active transaction by start time; if it is the
-        // same session, respond idempotently with its transactionId + Accepted. Returning ConcurrentTx
-        // here makes the charger treat the running session as DeAuthorized and stop a live charge
-        // (observed on Mennekes AMTRON after a websocket reconnect).
-        const reannouncedTransaction = activeTransactions.find(
-          (transaction) =>
-            transaction.startTime !== undefined &&
-            new Date(transaction.startTime).getTime() === new Date(request.timestamp).getTime(),
+        // Reconnect re-sends StartTransaction for the live session. Match station, connector and
+        // start time so a second connector with the same idTag is not treated as that session.
+        const reannouncedTransaction = this._findReannouncedOcpp16Transaction(
+          activeTransactions,
+          context.stationId,
+          connector?.id,
+          request.timestamp,
         );
         if (reannouncedTransaction) {
           response.idTagInfo.status = OCPP1_6.StartTransactionResponseStatus.Accepted;
           response.transactionId = parseInt(reannouncedTransaction.transactionId);
           return response;
         }
-        response.idTagInfo.status = OCPP1_6.StartTransactionResponseStatus.ConcurrentTx;
-        return response;
+
+        // Station-local tokens are shared across connectors (free charging). Other types stay
+        // single-session; honouring concurrentTransaction like 2.0.1 is a separate decision.
+        if (authorization.idTokenType !== IdTokenEnum.Local) {
+          response.idTagInfo.status = OCPP1_6.StartTransactionResponseStatus.ConcurrentTx;
+          return response;
+        }
       }
 
-      // Check authorizers
-      const connector = await this._locationRepository.readConnectorByStationIdAndOcpp16ConnectorId(
-        tenantId,
-        context.stationId,
-        connectorId,
-      );
       response.idTagInfo.status =
         OCPP1_6_Mapper.AuthorizationMapper.toStartTransactionResponseStatus(
           await this._applyAuthorizers(authorization, context, connector?.evse, connector),
@@ -384,6 +387,36 @@ export class TransactionService {
       );
 
     return activeTransactions.length > 0;
+  }
+
+  private _findReannouncedOcpp16Transaction(
+    activeTransactions: Array<{
+      stationId: string;
+      connectorId?: number;
+      startTime?: string;
+      transactionId: string;
+    }>,
+    stationId: string,
+    connectorDatabaseId: number | undefined,
+    timestamp: string,
+  ) {
+    const requestTime = new Date(timestamp).getTime();
+    return activeTransactions.find((transaction) => {
+      if (transaction.stationId !== stationId) {
+        return false;
+      }
+      if (
+        connectorDatabaseId !== undefined &&
+        transaction.connectorId !== undefined &&
+        transaction.connectorId !== connectorDatabaseId
+      ) {
+        return false;
+      }
+      return (
+        transaction.startTime !== undefined &&
+        new Date(transaction.startTime).getTime() === requestTime
+      );
+    });
   }
 
   private _mapAuthorizationDtoToIdTokenInfo(

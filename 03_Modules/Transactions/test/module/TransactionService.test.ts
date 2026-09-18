@@ -5,6 +5,7 @@ import {
   AuthorizationStatusEnum,
   DEFAULT_TENANT_ID,
   IAuthorizer,
+  IdTokenEnum,
   OCPP1_6,
   OCPP2_0_1,
 } from '@citrineos/base';
@@ -293,20 +294,138 @@ describe('TransactionService', () => {
     it('should accept a re-announced active transaction (reconnect) with its existing transactionId', async () => {
       const authorization = anAuthorization();
       authorizationRepository.readAllByQuerystring.mockResolvedValue([authorization]);
+      const stationId = faker.string.uuid();
+      const connectorDatabaseId = 11;
       const timestamp = '2026-07-06T12:36:37.000Z';
+      locationRepository.readConnectorByStationIdAndOcpp16ConnectorId.mockResolvedValue({
+        id: connectorDatabaseId,
+      } as never);
       transactionEventRepository.readAllActiveTransactionsByAuthorizationId.mockResolvedValue([
         aTransaction((transaction) => {
+          transaction.stationId = stationId;
+          transaction.connectorId = connectorDatabaseId;
           transaction.startTime = timestamp;
           transaction.transactionId = '42';
         }),
       ]);
 
-      const response = await transactionService.authorizeOcpp16IdToken(aMessageContext(), {
-        connectorId: 1,
-        idTag: authorization.idToken,
-        meterStart: 14003,
-        timestamp,
+      const response = await transactionService.authorizeOcpp16IdToken(
+        aMessageContext((context) => {
+          context.stationId = stationId;
+        }),
+        {
+          connectorId: 1,
+          idTag: authorization.idToken,
+          meterStart: 14003,
+          timestamp,
+        },
+      );
+
+      expect(response.idTagInfo.status).toBe(OCPP1_6.StartTransactionResponseStatus.Accepted);
+      expect(response.transactionId).toBe(42);
+    });
+
+    it('should not treat a second connector with the same timestamp as a reconnect', async () => {
+      const authorization = anAuthorization();
+      authorizationRepository.readAllByQuerystring.mockResolvedValue([authorization]);
+      const stationId = faker.string.uuid();
+      const timestamp = '2026-07-06T12:36:37.000Z';
+      locationRepository.readConnectorByStationIdAndOcpp16ConnectorId.mockResolvedValue({
+        id: 12,
+      } as never);
+      transactionEventRepository.readAllActiveTransactionsByAuthorizationId.mockResolvedValue([
+        aTransaction((transaction) => {
+          transaction.stationId = stationId;
+          transaction.connectorId = 11;
+          transaction.startTime = timestamp;
+          transaction.transactionId = '42';
+        }),
+      ]);
+
+      const response = await transactionService.authorizeOcpp16IdToken(
+        aMessageContext((context) => {
+          context.stationId = stationId;
+        }),
+        {
+          connectorId: 2,
+          idTag: authorization.idToken,
+          meterStart: 0,
+          timestamp,
+        },
+      );
+
+      expect(response.idTagInfo.status).toBe(OCPP1_6.StartTransactionResponseStatus.ConcurrentTx);
+      expect(response.transactionId).toBe(0);
+    });
+
+    it('should accept a parallel session for a station-local token', async () => {
+      const authorization = anAuthorization((auth) => {
+        auth.idTokenType = IdTokenEnum.Local;
       });
+      authorizationRepository.readAllByQuerystring.mockResolvedValue([authorization]);
+      const stationId = faker.string.uuid();
+      const timestamp = '2026-07-06T12:36:37.000Z';
+      locationRepository.readConnectorByStationIdAndOcpp16ConnectorId.mockResolvedValue({
+        id: 12,
+      } as never);
+      transactionEventRepository.readAllActiveTransactionsByAuthorizationId.mockResolvedValue([
+        aTransaction((transaction) => {
+          transaction.stationId = stationId;
+          transaction.connectorId = 11;
+          transaction.startTime = timestamp;
+          transaction.transactionId = '42';
+        }),
+      ]);
+      authorizer.authorize.mockResolvedValue(AuthorizationStatusEnum.Accepted);
+      realTimeAuthorizer.authorize.mockResolvedValue(AuthorizationStatusEnum.Accepted);
+
+      const response = await transactionService.authorizeOcpp16IdToken(
+        aMessageContext((context) => {
+          context.stationId = stationId;
+        }),
+        {
+          connectorId: 2,
+          idTag: authorization.idToken,
+          meterStart: 0,
+          timestamp,
+        },
+      );
+
+      expect(response.idTagInfo.status).toBe(OCPP1_6.StartTransactionResponseStatus.Accepted);
+      expect(response.transactionId).toBe(0);
+    });
+
+    it('should accept a re-announced station-local session with its existing transactionId', async () => {
+      const authorization = anAuthorization((auth) => {
+        auth.idTokenType = IdTokenEnum.Local;
+      });
+      authorizationRepository.readAllByQuerystring.mockResolvedValue([authorization]);
+      const stationId = faker.string.uuid();
+      const connectorDatabaseId = 11;
+      const timestamp = '2026-07-06T12:36:37.000Z';
+      locationRepository.readConnectorByStationIdAndOcpp16ConnectorId.mockResolvedValue({
+        id: connectorDatabaseId,
+      } as never);
+      transactionEventRepository.readAllActiveTransactionsByAuthorizationId.mockResolvedValue([
+        aTransaction((transaction) => {
+          transaction.stationId = stationId;
+          transaction.connectorId = connectorDatabaseId;
+          transaction.startTime = timestamp;
+          transaction.transactionId = '42';
+        }),
+      ]);
+
+      const response = await transactionService.authorizeOcpp16IdToken(
+        aMessageContext((context) => {
+          context.stationId = stationId;
+        }),
+        {
+          connectorId: 1,
+          idTag: authorization.idToken,
+          meterStart: 14003,
+          timestamp,
+        },
+      );
 
       expect(response.idTagInfo.status).toBe(OCPP1_6.StartTransactionResponseStatus.Accepted);
       expect(response.transactionId).toBe(42);
