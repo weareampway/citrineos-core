@@ -144,41 +144,49 @@ export class AdminApi extends AbstractModuleApi<IMessageRouter> implements IAdmi
   async getWebsocketConfigurations(
     request: FastifyRequest<{ Querystring: WebsocketGetQuerystring }>,
   ): Promise<WebsocketServerConfig[] | WebsocketServerConfig> {
-    if (request.query.id) {
-      const websocketConfig = this._module.config.util.networkConnection.websocketServers.find(
-        (ws) => ws.id === request.query.id,
-      );
+    const config = await ConfigStoreFactory.getInstance().fetchConfig();
+    if (!config) {
+      throw new NotFoundError('No configuration found in storage');
+    }
 
+    const websocketServers = config.util.networkConnection.websocketServers;
+    if (request.query.id) {
+      const websocketConfig = websocketServers.find((ws) => ws.id === request.query.id);
       if (!websocketConfig) {
         throw new NotFoundError(
           `Could not find websocket configuration with id ${request.query.id}`,
         );
-      } else {
-        return websocketConfig;
       }
-    } else {
-      // TODO when available (coming soon in a separate feature), filter by tenantId if the tenantId query param exists
-      return this._module.config.util.networkConnection.websocketServers;
+      return websocketConfig;
     }
+
+    const tenantId = request.query.tenantId;
+    if (tenantId !== undefined && String(tenantId) !== '') {
+      return websocketServers.filter((ws) => ws.tenantId === Number(tenantId));
+    }
+    return websocketServers;
   }
 
   @AsDataEndpoint(Namespace.Websocket, HttpMethod.Post, undefined, WebsocketRequestSchema)
   async createWebsocketConfiguration(
     request: FastifyRequest<{ Body: WebsocketServerConfig }>,
   ): Promise<WebsocketServerConfig> {
-    const existingConfig = this._module.config.util.networkConnection.websocketServers.find(
-      (ws) => ws.id === request.body.id,
-    );
-
-    if (existingConfig) {
-      throw new BadRequestError(
-        `Websocket configuration with id ${request.body.id} already exists.`,
-      );
-    } else {
-      this._module.config.util.networkConnection.websocketServers.push(request.body);
-      await ConfigStoreFactory.getInstance().saveConfig(this._module.config);
-      return request.body;
-    }
+    const updated = await ConfigStoreFactory.getInstance().updateConfig((config) => {
+      const servers = config.util.networkConnection.websocketServers;
+      if (servers.some((ws) => ws.id === request.body.id)) {
+        throw new BadRequestError(
+          `Websocket configuration with id ${request.body.id} already exists.`,
+        );
+      }
+      if (servers.some((ws) => ws.port === request.body.port)) {
+        throw new BadRequestError(
+          `Websocket configuration with port ${request.body.port} already exists.`,
+        );
+      }
+      servers.push(request.body);
+    });
+    this.applyWebsocketServers(updated.util.networkConnection.websocketServers);
+    return request.body;
   }
 
   /**
@@ -188,66 +196,81 @@ export class AdminApi extends AbstractModuleApi<IMessageRouter> implements IAdmi
   async addWebsocketConfigurationsForTenant(
     request: FastifyRequest<{ Body: { tenantId: number }; Querystring: TenantQueryString }>,
   ): Promise<WebsocketServerConfig[]> {
-    const existingConfig = this._module.config.util.networkConnection.websocketServers.find(
-      (ws) => ws.tenantId === request.body.tenantId,
-    );
+    const created: WebsocketServerConfig[] = [];
+    const updated = await ConfigStoreFactory.getInstance().updateConfig((config) => {
+      created.length = 0;
+      const servers = config.util.networkConnection.websocketServers;
+      if (servers.some((ws) => ws.tenantId === request.body.tenantId)) {
+        throw new BadRequestError(
+          `Websocket configurations for tenant ${request.body.tenantId} already exists.`,
+        );
+      }
 
-    if (existingConfig) {
-      throw new BadRequestError(
-        `Websocket configurations for tenant ${request.body.tenantId} already exists.`,
-      );
-    } else {
-      // 1. find the max port and max server id in the existing ws configs
-      const maxPort: number = this._module.config.util.networkConnection.websocketServers.reduce(
-        (max, ws) => Math.max(max, ws.port),
-        10000, // the stating value for dynamic ports
-      );
+      const template = servers[0];
+      if (!template) {
+        throw new BadRequestError(
+          'Cannot create new websocket server: no existing server to copy.',
+        );
+      }
+
+      const maxPort = servers.reduce((max, ws) => Math.max(max, ws.port), 10000);
       if (maxPort > 10500) {
         throw new BadRequestError('Cannot create new websocket server: maximum port 9000 reached.');
       }
 
-      const maxServerId: number =
-        this._module.config.util.networkConnection.websocketServers.reduce(
-          (max, ws) => Math.max(max, Number(ws.id)),
+      const maxServerId = servers.reduce((max, ws) => Math.max(max, Number(ws.id)), 0);
+      const newServers = [
+        this.buildWebsocketServer(
+          request.body.tenantId,
+          maxPort + 1,
+          maxServerId + 1,
           0,
-        );
-      // 2. create new ws servers, one for profile 0 and one for profile 1
-      const newServerForProfile0: WebsocketServerConfig = await this._createNewWebsocketServer(
-        request.body.tenantId,
-        maxPort + 1,
-        maxServerId + 1,
-        0,
-        true,
-        this._module.config.util.networkConnection.websocketServers[0],
-      );
-      const newServerForProfile1: WebsocketServerConfig = await this._createNewWebsocketServer(
-        request.body.tenantId,
-        maxPort + 2,
-        maxServerId + 2,
-        1,
-        false,
-        this._module.config.util.networkConnection.websocketServers[0],
-      );
+          true,
+          template,
+        ),
+        this.buildWebsocketServer(
+          request.body.tenantId,
+          maxPort + 2,
+          maxServerId + 2,
+          1,
+          false,
+          template,
+        ),
+      ];
+      servers.push(...newServers);
+      created.push(...newServers);
+    });
 
-      // 3. Save the updated configs in the file store
-      await ConfigStoreFactory.getInstance().saveConfig(this._module.config);
-
-      return [newServerForProfile0, newServerForProfile1];
+    this.applyWebsocketServers(updated.util.networkConnection.websocketServers);
+    for (const server of created) {
+      await this._serverNetworkProfileRepository.upsertServerNetworkProfile(
+        server,
+        updated.maxCallLengthSeconds,
+      );
+      await this._networkConnection.addWebsocketServer(server);
     }
+    return created;
   }
 
   @AsDataEndpoint(Namespace.Websocket, HttpMethod.Delete, WebsocketDeleteQuerySchema)
   async deleteWebsocketConfiguration(
     request: FastifyRequest<{ Querystring: WebsocketDeleteQuerystring }>,
   ): Promise<void> {
-    const existingConfigIndex =
-      this._module.config.util.networkConnection.websocketServers.findIndex(
-        (ws) => ws.id === request.query.id,
-      );
-
-    if (existingConfigIndex) {
-      this._module.config.util.networkConnection.websocketServers.splice(existingConfigIndex, 1);
-      await ConfigStoreFactory.getInstance().saveConfig(this._module.config);
+    try {
+      const updated = await ConfigStoreFactory.getInstance().updateConfig((config) => {
+        const servers = config.util.networkConnection.websocketServers;
+        const index = servers.findIndex((ws) => ws.id === request.query.id);
+        if (index < 0) {
+          throw new MissingWebsocketServerError();
+        }
+        servers.splice(index, 1);
+      });
+      this.applyWebsocketServers(updated.util.networkConnection.websocketServers);
+    } catch (error) {
+      if (error instanceof MissingWebsocketServerError) {
+        return;
+      }
+      throw error;
     }
   }
 
@@ -271,15 +294,20 @@ export class AdminApi extends AbstractModuleApi<IMessageRouter> implements IAdmi
     return super._toDataPath(input, endpointPrefix);
   }
 
-  private async _createNewWebsocketServer(
+  private applyWebsocketServers(servers: WebsocketServerConfig[]): void {
+    const live = this._module.config.util.networkConnection.websocketServers;
+    live.splice(0, live.length, ...servers);
+  }
+
+  private buildWebsocketServer(
     tenantId: number,
     port: number,
     serverId: number,
     securityProfile: number,
     allowUnknownChargingStations: boolean,
     existingServerConfig: WebsocketServerConfig,
-  ): Promise<WebsocketServerConfig> {
-    const newServerConfig: WebsocketServerConfig = {
+  ): WebsocketServerConfig {
+    return {
       id: serverId.toString(),
       host: existingServerConfig.host,
       port,
@@ -289,17 +317,12 @@ export class AdminApi extends AbstractModuleApi<IMessageRouter> implements IAdmi
       tenantId,
       allowUnknownChargingStations,
     };
+  }
+}
 
-    // save new config in db
-    await this._serverNetworkProfileRepository.upsertServerNetworkProfile(
-      newServerConfig,
-      this._module.config.maxCallLengthSeconds,
-    );
-    // start the new ws server
-    await this._networkConnection.addWebsocketServer(newServerConfig);
-    // add the new ws server to the config
-    this._module.config.util.networkConnection.websocketServers.push(newServerConfig);
-
-    return newServerConfig;
+class MissingWebsocketServerError extends Error {
+  constructor() {
+    super('Websocket server is not in the stored config');
+    this.name = 'MissingWebsocketServerError';
   }
 }

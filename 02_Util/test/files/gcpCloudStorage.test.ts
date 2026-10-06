@@ -11,6 +11,7 @@ vi.mock('@google-cloud/storage', () => {
     save: vi.fn(),
     exists: vi.fn(),
     download: vi.fn(),
+    getMetadata: vi.fn(),
   };
 
   const mockBucket = {
@@ -188,17 +189,18 @@ describe('GcpCloudStorage', () => {
   describe('fetchConfig', () => {
     it('should fetch and parse config successfully', async () => {
       const configString = JSON.stringify(mockSystemConfig);
-      mockFile.exists.mockResolvedValue([true]);
+      mockFile.getMetadata.mockResolvedValue([{ generation: '1' }]);
       mockFile.download.mockResolvedValue([Buffer.from(configString)]);
 
       const result = await gcpStorage.fetchConfig();
 
       expect(result).toEqual(mockSystemConfig);
       expect(mockBucket.file).toHaveBeenCalledWith('config.json');
+      expect(mockBucket.file).toHaveBeenCalledWith('config.json', { generation: '1' });
     });
 
     it('should return null if config file does not exist', async () => {
-      mockFile.exists.mockResolvedValue([false]);
+      mockFile.getMetadata.mockRejectedValue({ code: 404 });
 
       const result = await gcpStorage.fetchConfig();
 
@@ -207,7 +209,7 @@ describe('GcpCloudStorage', () => {
 
     it('should return null if 404 error occurs', async () => {
       const notFoundError = { code: 404 };
-      mockFile.exists.mockRejectedValue(notFoundError);
+      mockFile.getMetadata.mockRejectedValue(notFoundError);
 
       const result = await gcpStorage.fetchConfig();
 
@@ -216,7 +218,7 @@ describe('GcpCloudStorage', () => {
 
     it('should return null if "could not find" error occurs', async () => {
       const notFoundError = { message: 'could not find config file' };
-      mockFile.exists.mockRejectedValue(notFoundError);
+      mockFile.getMetadata.mockRejectedValue(notFoundError);
 
       const result = await gcpStorage.fetchConfig();
 
@@ -225,13 +227,13 @@ describe('GcpCloudStorage', () => {
 
     it('should throw error for non-404 errors', async () => {
       const error = new Error('Network timeout');
-      mockFile.exists.mockRejectedValue(error);
+      mockFile.getMetadata.mockRejectedValue(error);
 
       await expect(gcpStorage.fetchConfig()).rejects.toThrow('Network timeout');
     });
 
     it('should handle invalid JSON gracefully', async () => {
-      mockFile.exists.mockResolvedValue([true]);
+      mockFile.getMetadata.mockResolvedValue([{ generation: '1' }]);
       mockFile.download.mockResolvedValue([Buffer.from('invalid json{')]);
 
       await expect(gcpStorage.fetchConfig()).rejects.toThrow();

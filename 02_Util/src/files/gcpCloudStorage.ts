@@ -6,6 +6,7 @@ import type { BootstrapConfig, ConfigStore, SystemConfig } from '@citrineos/base
 import { Bucket, Storage } from '@google-cloud/storage';
 import type { ILogObj } from 'tslog';
 import { Logger } from 'tslog';
+import { commitConfigUpdate, ConfigVersionConflictError } from './commitConfigUpdate.js';
 
 export class GcpCloudStorage implements ConfigStore {
   protected readonly _logger: Logger<ILogObj>;
@@ -91,20 +92,30 @@ export class GcpCloudStorage implements ConfigStore {
     }
   }
 
-  /**
-   * Load JSON config from GCS and parse as SystemConfig.
-   */
   async fetchConfig(): Promise<SystemConfig | null> {
+    const loaded = await this.fetchVersionedConfig();
+    return loaded?.config ?? null;
+  }
+
+  async updateConfig(mutate: (config: SystemConfig) => void): Promise<SystemConfig> {
+    const updated = await commitConfigUpdate(
+      () => this.fetchVersionedConfig(),
+      (config, version) => this.putConfig(config, { ifGenerationMatch: version }),
+      mutate,
+    );
+    this._logger.info('Config saved to GCP Cloud Storage.');
+    return updated;
+  }
+
+  async saveConfigIfAbsent(config: SystemConfig): Promise<boolean> {
     try {
-      const configString = await this.getFile(this.configFileName, this.configBucketName);
-      if (!configString) return null;
-      return JSON.parse(configString) as SystemConfig;
-    } catch (error: any) {
-      if (this.isNotFoundError(error)) {
-        this._logger.warn('Config not found in GCP Cloud Storage.');
-        return null;
+      await this.putConfig(config, { ifGenerationMatch: 0 });
+      this._logger.info('Config saved to GCP Cloud Storage.');
+      return true;
+    } catch (error) {
+      if (error instanceof ConfigVersionConflictError) {
+        return false;
       }
-      this._logger.error('Error fetching config from GCP Cloud Storage:', error);
       throw error;
     }
   }
@@ -119,6 +130,65 @@ export class GcpCloudStorage implements ConfigStore {
       this.configBucketName,
     );
     this._logger.info('Config saved to GCP Cloud Storage.');
+  }
+
+  private async fetchVersionedConfig(): Promise<{ config: SystemConfig; version: string } | null> {
+    const bucket = this.getBucket(this.configBucketName);
+    const file = bucket.file(this.configFileName);
+    try {
+      const [metadata] = await file.getMetadata();
+      if (metadata.generation === undefined || metadata.generation === null) {
+        throw new Error('GCS config object is missing a generation');
+      }
+      const generation = String(metadata.generation);
+      const pinned = bucket.file(this.configFileName, { generation });
+      const [contents] = await pinned.download();
+      return {
+        config: JSON.parse(contents.toString('utf-8')) as SystemConfig,
+        version: generation,
+      };
+    } catch (error: any) {
+      if (this.isNotFoundError(error)) {
+        this._logger.warn('Config not found in GCP Cloud Storage.');
+        return null;
+      }
+      this._logger.error('Error fetching config from GCP Cloud Storage:', error);
+      throw error;
+    }
+  }
+
+  private async putConfig(
+    config: SystemConfig,
+    precondition: { ifGenerationMatch: number | string },
+  ): Promise<void> {
+    const bucketName = this.configBucketName;
+    const file = this.getBucket(bucketName).file(this.configFileName);
+    try {
+      await file.save(Buffer.from(JSON.stringify(config, null, 2)), {
+        contentType: 'application/octet-stream',
+        resumable: false,
+        preconditionOpts: precondition,
+      });
+    } catch (error: any) {
+      if (error instanceof ConfigVersionConflictError) {
+        throw error;
+      }
+      if (this.isPreconditionFailure(error)) {
+        throw new ConfigVersionConflictError();
+      }
+      if (this.isNotFoundError(error)) {
+        this._logger.warn(`Bucket "${bucketName}" not found. Creating it...`);
+        await this.createBucket(bucketName);
+        this._logger.info(`Bucket "${bucketName}" created. Retrying config save...`);
+        return this.putConfig(config, precondition);
+      }
+      this._logger.error('Error saving config to GCP Cloud Storage:', error);
+      throw error;
+    }
+  }
+
+  private isPreconditionFailure(error: { code?: number }): boolean {
+    return error?.code === 412 || error?.code === 409;
   }
 
   private getBucket(name: string): Bucket {

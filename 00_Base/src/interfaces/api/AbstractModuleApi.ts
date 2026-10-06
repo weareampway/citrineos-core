@@ -406,8 +406,20 @@ export abstract class AbstractModuleApi<T extends IModule> implements IModuleApi
       this,
       OCPP2_0_1_Namespace.SystemConfig,
       async (request: FastifyRequest<{ Body: SystemConfig }>) => {
-        await ConfigStoreFactory.getInstance().saveConfig(request.body);
-        module.config = request.body;
+        const updated = await ConfigStoreFactory.getInstance().updateConfig((latest) => {
+          const websocketServers = latest.util.networkConnection.websocketServers.slice();
+          const replacement = structuredClone(request.body);
+          replacement.util.networkConnection.websocketServers = websocketServers;
+          Object.assign(latest, replacement);
+        });
+        const liveServers = module.config.util.networkConnection.websocketServers;
+        liveServers.splice(
+          0,
+          liveServers.length,
+          ...updated.util.networkConnection.websocketServers,
+        );
+        updated.util.networkConnection.websocketServers = liveServers;
+        module.config = updated;
       },
       HttpMethod.Put,
       undefined,
