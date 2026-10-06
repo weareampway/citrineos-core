@@ -7,11 +7,17 @@ import {
   PutObjectCommand,
   S3Client,
 } from '@aws-sdk/client-s3';
-import type { BootstrapConfig, ConfigStore, SystemConfig } from '@citrineos/base';
+import {
+  assignMergedSystemConfig,
+  type BootstrapConfig,
+  type ConfigStore,
+  type SystemConfig,
+} from '@citrineos/base';
 import { Readable } from 'stream';
 import type { ILogObj } from 'tslog';
 import { Logger } from 'tslog';
 import { commitConfigUpdate, ConfigVersionConflictError } from './commitConfigUpdate.js';
+import { createWriteQueue } from './writeQueue.js';
 
 export class S3Storage implements ConfigStore {
   protected readonly _logger: Logger<ILogObj>;
@@ -19,6 +25,7 @@ export class S3Storage implements ConfigStore {
   private defaultBucketName: string;
   private configFileName: string;
   private configBucketName: string | undefined;
+  private readonly enqueue = createWriteQueue();
 
   constructor(
     config: BootstrapConfig['fileAccess']['s3'],
@@ -97,35 +104,36 @@ export class S3Storage implements ConfigStore {
   }
 
   async updateConfig(mutate: (config: SystemConfig) => void): Promise<SystemConfig> {
-    const updated = await commitConfigUpdate(
-      () => this.fetchVersionedConfig(),
-      (config, version) => this.putConfig(config, { ifMatch: version }),
-      mutate,
+    const updated = await this.enqueue(() =>
+      commitConfigUpdate(
+        () => this.fetchVersionedConfig(),
+        (config, version) => this.putConfig(config, { ifMatch: version }),
+        mutate,
+      ),
     );
     this._logger.info('Config saved to S3.');
     return updated;
   }
 
   async saveConfigIfAbsent(config: SystemConfig): Promise<boolean> {
-    try {
-      await this.putConfig(config, { ifNoneMatch: '*' });
-      this._logger.info('Config saved to S3.');
-      return true;
-    } catch (error) {
-      if (error instanceof ConfigVersionConflictError) {
-        return false;
+    return this.enqueue(async () => {
+      try {
+        await this.putConfig(config, { ifNoneMatch: '*' });
+        this._logger.info('Config saved to S3.');
+        return true;
+      } catch (error) {
+        if (error instanceof ConfigVersionConflictError) {
+          return false;
+        }
+        throw error;
       }
-      throw error;
-    }
+    });
   }
 
   async saveConfig(config: SystemConfig): Promise<void> {
-    await this.saveFile(
-      this.configFileName,
-      Buffer.from(JSON.stringify(config, null, 2)),
-      this.configBucketName,
-    );
-    this._logger.info('Config saved to S3.');
+    await this.updateConfig((latest) => {
+      assignMergedSystemConfig(latest, config);
+    });
   }
 
   private async createBucket(bucket: string): Promise<void> {

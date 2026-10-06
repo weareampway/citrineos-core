@@ -196,14 +196,10 @@ export class AdminApi extends AbstractModuleApi<IMessageRouter> implements IAdmi
   async addWebsocketConfigurationsForTenant(
     request: FastifyRequest<{ Body: { tenantId: number }; Querystring: TenantQueryString }>,
   ): Promise<WebsocketServerConfig[]> {
-    const created: WebsocketServerConfig[] = [];
     const updated = await ConfigStoreFactory.getInstance().updateConfig((config) => {
-      created.length = 0;
       const servers = config.util.networkConnection.websocketServers;
       if (servers.some((ws) => ws.tenantId === request.body.tenantId)) {
-        throw new BadRequestError(
-          `Websocket configurations for tenant ${request.body.tenantId} already exists.`,
-        );
+        return;
       }
 
       const template = servers[0];
@@ -214,12 +210,15 @@ export class AdminApi extends AbstractModuleApi<IMessageRouter> implements IAdmi
       }
 
       const maxPort = servers.reduce((max, ws) => Math.max(max, ws.port), 10000);
-      if (maxPort > 10500) {
-        throw new BadRequestError('Cannot create new websocket server: maximum port 9000 reached.');
+      const maxWebsocketPort = 10500;
+      if (maxPort + 2 > maxWebsocketPort) {
+        throw new BadRequestError(
+          'Cannot create new websocket server: maximum port 10500 reached.',
+        );
       }
 
       const maxServerId = servers.reduce((max, ws) => Math.max(max, Number(ws.id)), 0);
-      const newServers = [
+      servers.push(
         this.buildWebsocketServer(
           request.body.tenantId,
           maxPort + 1,
@@ -236,20 +235,21 @@ export class AdminApi extends AbstractModuleApi<IMessageRouter> implements IAdmi
           false,
           template,
         ),
-      ];
-      servers.push(...newServers);
-      created.push(...newServers);
+      );
     });
 
     this.applyWebsocketServers(updated.util.networkConnection.websocketServers);
-    for (const server of created) {
+    const tenantServers = updated.util.networkConnection.websocketServers.filter(
+      (ws) => ws.tenantId === request.body.tenantId,
+    );
+    for (const server of tenantServers) {
       await this._serverNetworkProfileRepository.upsertServerNetworkProfile(
         server,
         updated.maxCallLengthSeconds,
       );
       await this._networkConnection.addWebsocketServer(server);
     }
-    return created;
+    return tenantServers;
   }
 
   @AsDataEndpoint(Namespace.Websocket, HttpMethod.Delete, WebsocketDeleteQuerySchema)
@@ -267,11 +267,11 @@ export class AdminApi extends AbstractModuleApi<IMessageRouter> implements IAdmi
       });
       this.applyWebsocketServers(updated.util.networkConnection.websocketServers);
     } catch (error) {
-      if (error instanceof MissingWebsocketServerError) {
-        return;
+      if (!(error instanceof MissingWebsocketServerError)) {
+        throw error;
       }
-      throw error;
     }
+    await this._networkConnection.removeWebsocketServer(request.query.id);
   }
 
   // Forcibly disconnect a websocket connection by station id and tenant id and mark the station as offline

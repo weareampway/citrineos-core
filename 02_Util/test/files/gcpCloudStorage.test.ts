@@ -232,6 +232,22 @@ describe('GcpCloudStorage', () => {
       await expect(gcpStorage.fetchConfig()).rejects.toThrow('Network timeout');
     });
 
+    it('retries when the pinned generation disappears', async () => {
+      mockFile.getMetadata
+        .mockResolvedValueOnce([{ generation: '1' }])
+        .mockResolvedValueOnce([{ generation: '2' }]);
+      mockFile.download
+        .mockRejectedValueOnce({ code: 404 })
+        .mockResolvedValueOnce([Buffer.from(JSON.stringify(mockSystemConfig))]);
+
+      const result = await gcpStorage.fetchConfig();
+
+      expect(result).toEqual(mockSystemConfig);
+      expect(mockFile.getMetadata).toHaveBeenCalledTimes(2);
+      expect(mockBucket.file).toHaveBeenCalledWith('config.json', { generation: '1' });
+      expect(mockBucket.file).toHaveBeenCalledWith('config.json', { generation: '2' });
+    });
+
     it('should handle invalid JSON gracefully', async () => {
       mockFile.getMetadata.mockResolvedValue([{ generation: '1' }]);
       mockFile.download.mockResolvedValue([Buffer.from('invalid json{')]);
@@ -241,17 +257,51 @@ describe('GcpCloudStorage', () => {
   });
 
   describe('saveConfig', () => {
+    const storedConfig = {
+      modules: {},
+      util: {
+        networkConnection: {
+          websocketServers: [
+            { id: '1', host: 'localhost', port: 9000, tenantId: 1 },
+            { id: '2', host: 'localhost', port: 9002, tenantId: 2 },
+          ],
+        },
+      },
+    } as SystemConfig;
+
+    beforeEach(() => {
+      mockFile.getMetadata.mockResolvedValue([{ generation: '4' }]);
+      mockFile.download.mockResolvedValue([Buffer.from(JSON.stringify(storedConfig))]);
+    });
+
     it('should save config successfully', async () => {
       mockFile.save.mockResolvedValue(undefined);
 
-      await gcpStorage.saveConfig(mockSystemConfig);
+      await gcpStorage.saveConfig(storedConfig);
 
-      const expectedContent = Buffer.from(JSON.stringify(mockSystemConfig, null, 2));
-      expect(mockBucket.file).toHaveBeenCalledWith('config.json');
-      expect(mockFile.save).toHaveBeenCalledWith(expectedContent, {
+      const saved = JSON.parse(mockFile.save.mock.calls[0][0].toString('utf-8'));
+      expect(saved).toEqual(storedConfig);
+      expect(mockFile.save).toHaveBeenCalledWith(expect.any(Buffer), {
         contentType: 'application/octet-stream',
         resumable: false,
+        preconditionOpts: { ifGenerationMatch: '4' },
       });
+    });
+
+    it('keeps a stored websocket server that the incoming config does not contain', async () => {
+      mockFile.save.mockResolvedValue(undefined);
+      const incoming = structuredClone(storedConfig);
+      incoming.util.networkConnection.websocketServers = [
+        { ...storedConfig.util.networkConnection.websocketServers[0], host: '10.0.0.8' },
+      ];
+
+      await gcpStorage.saveConfig(incoming);
+
+      const saved = JSON.parse(mockFile.save.mock.calls[0][0].toString('utf-8'));
+      expect(saved.util.networkConnection.websocketServers).toEqual([
+        { ...storedConfig.util.networkConnection.websocketServers[0], host: '10.0.0.8' },
+        storedConfig.util.networkConnection.websocketServers[1],
+      ]);
     });
 
     it('should create bucket and retry if bucket not found', async () => {
@@ -259,7 +309,7 @@ describe('GcpCloudStorage', () => {
       mockFile.save.mockRejectedValueOnce(notFoundError).mockResolvedValueOnce(undefined);
       mockStorageInstance.createBucket.mockResolvedValue(undefined);
 
-      await gcpStorage.saveConfig(mockSystemConfig);
+      await gcpStorage.saveConfig(storedConfig);
 
       expect(mockStorageInstance.createBucket).toHaveBeenCalledWith('test-bucket');
       expect(mockFile.save).toHaveBeenCalledTimes(2);
@@ -269,23 +319,20 @@ describe('GcpCloudStorage', () => {
       const error = new Error('Insufficient permissions');
       mockFile.save.mockRejectedValue(error);
 
-      await expect(gcpStorage.saveConfig(mockSystemConfig)).rejects.toThrow(
-        'Insufficient permissions',
-      );
+      await expect(gcpStorage.saveConfig(storedConfig)).rejects.toThrow('Insufficient permissions');
     });
 
     it('should properly format JSON with indentation', async () => {
       mockFile.save.mockResolvedValue(undefined);
 
-      await gcpStorage.saveConfig(mockSystemConfig);
+      await gcpStorage.saveConfig(storedConfig);
 
-      const expectedContent = Buffer.from(JSON.stringify(mockSystemConfig, null, 2));
-      expect(mockFile.save).toHaveBeenCalledWith(
-        expectedContent,
-        expect.objectContaining({
-          contentType: 'application/octet-stream',
-        }),
-      );
+      const expectedContent = Buffer.from(JSON.stringify(storedConfig, null, 2));
+      expect(mockFile.save).toHaveBeenCalledWith(expectedContent, {
+        contentType: 'application/octet-stream',
+        resumable: false,
+        preconditionOpts: { ifGenerationMatch: '4' },
+      });
     });
   });
 });

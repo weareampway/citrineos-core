@@ -36,6 +36,7 @@ export class WebsocketNetworkConnection implements INetworkConnection {
   private _identifierConnections: Map<string, WebSocket> = new Map();
   // websocketServers id as key and http server as value
   private _httpServersMap: Map<string, http.Server | https.Server>;
+  private readonly _serverStarts = new Map<string, Promise<void>>();
   private _authenticator: IAuthenticator;
   private _router: IMessageRouter;
 
@@ -56,10 +57,11 @@ export class WebsocketNetworkConnection implements INetworkConnection {
     this._router = router;
 
     this._httpServersMap = new Map<string, http.Server | https.Server>();
-    this._config.util.networkConnection.websocketServers.forEach(async (websocketServerConfig) => {
-      const _httpServer = await this._createAndStartWebsocketServer(websocketServerConfig);
-      this._httpServersMap.set(websocketServerConfig.id, _httpServer);
-    });
+    for (const websocketServerConfig of this._config.util.networkConnection.websocketServers) {
+      void this.addWebsocketServer(websocketServerConfig).catch((error: unknown) => {
+        this._logger.error('Failed to start websocket server', error);
+      });
+    }
   }
 
   /**
@@ -169,8 +171,13 @@ export class WebsocketNetworkConnection implements INetworkConnection {
    * @returns {Promise<void>}
    */
   async addWebsocketServer(websocketServerConfig: WebsocketServerConfig): Promise<void> {
-    const httpServer = await this._createAndStartWebsocketServer(websocketServerConfig);
-    this._httpServersMap.set(websocketServerConfig.id, httpServer);
+    return this.enqueueServer(websocketServerConfig.id, () =>
+      this.startWebsocketServer(websocketServerConfig),
+    );
+  }
+
+  async removeWebsocketServer(serverId: string): Promise<void> {
+    return this.enqueueServer(serverId, () => this.stopWebsocketServer(serverId));
   }
 
   private _onHttpRequest(req: http.IncomingMessage, res: http.ServerResponse) {
@@ -499,10 +506,50 @@ export class WebsocketNetworkConnection implements INetworkConnection {
     return serverOptions;
   }
 
+  private enqueueServer(serverId: string, operation: () => Promise<void>): Promise<void> {
+    const previous = this._serverStarts.get(serverId) ?? Promise.resolve();
+    const run = previous.then(operation);
+    this._serverStarts.set(
+      serverId,
+      run.then(
+        () => undefined,
+        () => undefined,
+      ),
+    );
+    return run;
+  }
+
+  private async startWebsocketServer(websocketServerConfig: WebsocketServerConfig): Promise<void> {
+    if (this._httpServersMap.has(websocketServerConfig.id)) {
+      return;
+    }
+    const httpServer = await this._createAndStartWebsocketServer(websocketServerConfig);
+    this._httpServersMap.set(websocketServerConfig.id, httpServer);
+  }
+
+  private async stopWebsocketServer(serverId: string): Promise<void> {
+    const httpServer = this._httpServersMap.get(serverId);
+    if (!httpServer) {
+      return;
+    }
+    this._httpServersMap.delete(serverId);
+    httpServer.closeAllConnections();
+    await new Promise<void>((resolve, reject) => {
+      httpServer.close((error) => {
+        if (error && (error as NodeJS.ErrnoException).code !== 'ERR_SERVER_NOT_RUNNING') {
+          reject(error);
+          return;
+        }
+        resolve();
+      });
+    });
+  }
+
   private _createAndStartWebsocketServer(
     wsConfig: WebsocketServerConfig,
   ): Promise<http.Server | https.Server> {
-    return new Promise((resolve) => {
+    return new Promise((resolve, reject) => {
+      let settled = false;
       let httpServer: http.Server | https.Server;
       switch (wsConfig.securityProfile) {
         case 3: // mTLS
@@ -535,11 +582,22 @@ export class WebsocketNetworkConnection implements INetworkConnection {
       httpServer.on('upgrade', (req, socket, head) =>
         this._upgradeRequest(req, socket, head, wss, wsConfig),
       );
-      httpServer.on('error', (error) => wss.emit('error', error));
+      httpServer.on('error', (error) => {
+        wss.emit('error', error);
+        if (!settled) {
+          settled = true;
+          httpServer.close();
+          reject(error);
+        }
+      });
       httpServer.on('close', () => wss.emit('close'));
 
       const protocol = wsConfig.securityProfile > 1 ? 'wss' : 'ws';
       httpServer.listen(wsConfig.port, wsConfig.host, () => {
+        if (settled) {
+          return;
+        }
+        settled = true;
         this._logger.info(
           `WebsocketServer running on ${protocol}://${wsConfig.host}:${wsConfig.port}/`,
         );

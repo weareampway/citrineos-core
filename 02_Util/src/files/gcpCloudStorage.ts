@@ -2,17 +2,24 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-import type { BootstrapConfig, ConfigStore, SystemConfig } from '@citrineos/base';
+import {
+  assignMergedSystemConfig,
+  type BootstrapConfig,
+  type ConfigStore,
+  type SystemConfig,
+} from '@citrineos/base';
 import { Bucket, Storage } from '@google-cloud/storage';
 import type { ILogObj } from 'tslog';
 import { Logger } from 'tslog';
 import { commitConfigUpdate, ConfigVersionConflictError } from './commitConfigUpdate.js';
+import { createWriteQueue } from './writeQueue.js';
 
 export class GcpCloudStorage implements ConfigStore {
   protected readonly _logger: Logger<ILogObj>;
   private storageClient: Storage;
   private configBucketName: string;
   private configFileName: string;
+  private readonly enqueue = createWriteQueue();
 
   constructor(
     config: BootstrapConfig['fileAccess']['gcp'],
@@ -98,63 +105,77 @@ export class GcpCloudStorage implements ConfigStore {
   }
 
   async updateConfig(mutate: (config: SystemConfig) => void): Promise<SystemConfig> {
-    const updated = await commitConfigUpdate(
-      () => this.fetchVersionedConfig(),
-      (config, version) => this.putConfig(config, { ifGenerationMatch: version }),
-      mutate,
+    const updated = await this.enqueue(() =>
+      commitConfigUpdate(
+        () => this.fetchVersionedConfig(),
+        (config, version) => this.putConfig(config, { ifGenerationMatch: version }),
+        mutate,
+      ),
     );
     this._logger.info('Config saved to GCP Cloud Storage.');
     return updated;
   }
 
   async saveConfigIfAbsent(config: SystemConfig): Promise<boolean> {
-    try {
-      await this.putConfig(config, { ifGenerationMatch: 0 });
-      this._logger.info('Config saved to GCP Cloud Storage.');
-      return true;
-    } catch (error) {
-      if (error instanceof ConfigVersionConflictError) {
-        return false;
+    return this.enqueue(async () => {
+      try {
+        await this.putConfig(config, { ifGenerationMatch: 0 });
+        this._logger.info('Config saved to GCP Cloud Storage.');
+        return true;
+      } catch (error) {
+        if (error instanceof ConfigVersionConflictError) {
+          return false;
+        }
+        throw error;
       }
-      throw error;
-    }
+    });
   }
 
-  /**
-   * Serialize and save SystemConfig JSON to GCS.
-   */
   async saveConfig(config: SystemConfig): Promise<void> {
-    await this.saveFile(
-      this.configFileName,
-      Buffer.from(JSON.stringify(config, null, 2)),
-      this.configBucketName,
-    );
-    this._logger.info('Config saved to GCP Cloud Storage.');
+    await this.updateConfig((latest) => {
+      assignMergedSystemConfig(latest, config);
+    });
   }
 
   private async fetchVersionedConfig(): Promise<{ config: SystemConfig; version: string } | null> {
     const bucket = this.getBucket(this.configBucketName);
-    const file = bucket.file(this.configFileName);
-    try {
-      const [metadata] = await file.getMetadata();
-      if (metadata.generation === undefined || metadata.generation === null) {
-        throw new Error('GCS config object is missing a generation');
+    const readAttempts = 5;
+
+    for (let attempt = 0; attempt < readAttempts; attempt++) {
+      const file = bucket.file(this.configFileName);
+      let generation: string;
+      try {
+        const [metadata] = await file.getMetadata();
+        if (metadata.generation === undefined || metadata.generation === null) {
+          throw new Error('GCS config object is missing a generation');
+        }
+        generation = String(metadata.generation);
+      } catch (error: any) {
+        if (this.isNotFoundError(error)) {
+          this._logger.warn('Config not found in GCP Cloud Storage.');
+          return null;
+        }
+        this._logger.error('Error fetching config from GCP Cloud Storage:', error);
+        throw error;
       }
-      const generation = String(metadata.generation);
-      const pinned = bucket.file(this.configFileName, { generation });
-      const [contents] = await pinned.download();
-      return {
-        config: JSON.parse(contents.toString('utf-8')) as SystemConfig,
-        version: generation,
-      };
-    } catch (error: any) {
-      if (this.isNotFoundError(error)) {
-        this._logger.warn('Config not found in GCP Cloud Storage.');
-        return null;
+
+      try {
+        const pinned = bucket.file(this.configFileName, { generation });
+        const [contents] = await pinned.download();
+        return {
+          config: JSON.parse(contents.toString('utf-8')) as SystemConfig,
+          version: generation,
+        };
+      } catch (error: any) {
+        if (this.isNotFoundError(error) && attempt < readAttempts - 1) {
+          continue;
+        }
+        this._logger.error('Error fetching config from GCP Cloud Storage:', error);
+        throw error;
       }
-      this._logger.error('Error fetching config from GCP Cloud Storage:', error);
-      throw error;
     }
+
+    throw new Error('GCS config generation changed while reading');
   }
 
   private async putConfig(
