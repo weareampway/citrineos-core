@@ -21,6 +21,7 @@ import {
 import fs from 'fs';
 import * as http from 'http';
 import * as https from 'https';
+import type { Socket } from 'net';
 import { Duplex } from 'stream';
 import type { SecureContextOptions } from 'tls';
 import type { ILogObj } from 'tslog';
@@ -36,6 +37,7 @@ export class WebsocketNetworkConnection implements INetworkConnection {
   private _identifierConnections: Map<string, WebSocket> = new Map();
   // websocketServers id as key and http server as value
   private _httpServersMap: Map<string, http.Server | https.Server>;
+  private readonly _serverSockets = new WeakMap<http.Server | https.Server, Set<Socket>>();
   private readonly _serverStarts = new Map<string, Promise<void>>();
   private _authenticator: IAuthenticator;
   private _router: IMessageRouter;
@@ -532,8 +534,6 @@ export class WebsocketNetworkConnection implements INetworkConnection {
     if (!httpServer) {
       return;
     }
-    this._httpServersMap.delete(serverId);
-    httpServer.closeAllConnections();
     await new Promise<void>((resolve, reject) => {
       httpServer.close((error) => {
         if (error && (error as NodeJS.ErrnoException).code !== 'ERR_SERVER_NOT_RUNNING') {
@@ -542,7 +542,14 @@ export class WebsocketNetworkConnection implements INetworkConnection {
         }
         resolve();
       });
+      // HTTP closeAllConnections() excludes upgraded sockets and pending upgrades.
+      // Stop accepting connections first, then close every socket owned by this listener.
+      for (const socket of this._serverSockets.get(httpServer) ?? []) {
+        socket.destroy();
+      }
     });
+    this._httpServersMap.delete(serverId);
+    this._serverSockets.delete(httpServer);
   }
 
   private _createAndStartWebsocketServer(
@@ -565,6 +572,13 @@ export class WebsocketNetworkConnection implements INetworkConnection {
           httpServer = http.createServer(this._onHttpRequest.bind(this));
           break;
       }
+
+      const sockets = new Set<Socket>();
+      this._serverSockets.set(httpServer, sockets);
+      httpServer.on('connection', (socket: Socket) => {
+        sockets.add(socket);
+        socket.once('close', () => sockets.delete(socket));
+      });
 
       const wss = new WebSocketServer({
         noServer: true,
