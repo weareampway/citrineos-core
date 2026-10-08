@@ -10,6 +10,7 @@ import type { IDataEndpointDefinition, IMessageEndpointDefinition } from './inde
 import { HttpMethod, METADATA_DATA_ENDPOINTS, METADATA_MESSAGE_ENDPOINTS } from './index.js';
 import type { OcppRequest, SystemConfig } from '../../index.js';
 import {
+  assignMergedSystemConfig,
   ConfigStoreFactory,
   DEFAULT_TENANT_ID,
   MessageConfirmationSchema,
@@ -395,7 +396,16 @@ export abstract class AbstractModuleApi<T extends IModule> implements IModuleApi
     this._addDataRoute.call(
       this,
       OCPP2_0_1_Namespace.SystemConfig,
-      () => new Promise((resolve) => resolve(module.config)),
+      async () => {
+        const stored = await ConfigStoreFactory.getInstance().fetchConfig();
+        if (!stored) {
+          return module.config;
+        }
+        const response = structuredClone(module.config);
+        response.util.networkConnection.websocketServers =
+          stored.util.networkConnection.websocketServers;
+        return response;
+      },
       HttpMethod.Get,
     );
 
@@ -406,8 +416,17 @@ export abstract class AbstractModuleApi<T extends IModule> implements IModuleApi
       this,
       OCPP2_0_1_Namespace.SystemConfig,
       async (request: FastifyRequest<{ Body: SystemConfig }>) => {
-        await ConfigStoreFactory.getInstance().saveConfig(request.body);
-        module.config = request.body;
+        const updated = await ConfigStoreFactory.getInstance().updateConfig((latest) => {
+          assignMergedSystemConfig(latest, request.body);
+        });
+        const liveServers = module.config.util.networkConnection.websocketServers;
+        liveServers.splice(
+          0,
+          liveServers.length,
+          ...updated.util.networkConnection.websocketServers,
+        );
+        updated.util.networkConnection.websocketServers = liveServers;
+        module.config = updated;
       },
       HttpMethod.Put,
       undefined,

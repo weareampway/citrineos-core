@@ -60,9 +60,19 @@ export async function loadSystemConfig(
       }
 
       console.warn('No config found in storage. Creating default config...');
-      config = defaultConfig;
-      await configStore.saveConfig(config);
-      console.log('Default config saved to storage');
+      const created = await configStore.saveConfigIfAbsent(defaultConfig);
+      if (created) {
+        config = defaultConfig;
+        console.log('Default config saved to storage');
+      } else {
+        config = await configStore.fetchConfig();
+        if (!config) {
+          throw new Error(
+            'No configuration found in storage and creating the default config did not succeed',
+          );
+        }
+        console.log('Configuration loaded from storage');
+      }
     } else {
       console.log('Configuration loaded from storage');
     }

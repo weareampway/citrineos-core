@@ -7,6 +7,8 @@ import type { SystemConfig } from './types.js';
 
 export interface ConfigStore extends IFileStorage {
   fetchConfig(): Promise<SystemConfig | null>;
+  updateConfig(mutate: (config: SystemConfig) => void): Promise<SystemConfig>;
+  saveConfigIfAbsent(config: SystemConfig): Promise<boolean>;
   saveConfig(config: SystemConfig): Promise<void>;
 }
 

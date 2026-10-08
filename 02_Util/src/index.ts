@@ -15,6 +15,8 @@ export { S3Storage } from './files/s3Storage.js';
 export { GcpCloudStorage } from './files/gcpCloudStorage.js';
 export { FtpServer } from './files/ftpServer.js';
 export { LocalStorage } from './files/localStorage.js';
+export { commitConfigUpdate, ConfigVersionConflictError } from './files/commitConfigUpdate.js';
+export type { VersionedConfig } from './files/commitConfigUpdate.js';
 export * from './queue/index.js';
 export * from './networkconnection/index.js';
 export * from './certificate/index.js';

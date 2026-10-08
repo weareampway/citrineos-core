@@ -3,15 +3,19 @@
 // SPDX-License-Identifier: Apache-2.0
 import fs from 'fs';
 import path from 'path';
-import type { ConfigStore, SystemConfig } from '@citrineos/base';
+import { assignMergedSystemConfig, type ConfigStore, type SystemConfig } from '@citrineos/base';
 import type { ILogObj } from 'tslog';
 import { Logger } from 'tslog';
+import { commitConfigUpdate, ConfigVersionConflictError } from './commitConfigUpdate.js';
+import { createWriteQueue } from './writeQueue.js';
 
 export class LocalStorage implements ConfigStore {
   protected readonly _logger: Logger<ILogObj>;
   private defaultFilePath: string;
   private configFileName: string;
   private configDir: string | undefined;
+  private readonly enqueue = createWriteQueue();
+  private generation = 0;
 
   constructor(
     defaultFilePath: string,
@@ -62,16 +66,48 @@ export class LocalStorage implements ConfigStore {
     }
   }
 
-  async saveConfig(config: SystemConfig): Promise<void> {
-    try {
-      await this.saveFile(
-        this.configFileName,
-        Buffer.from(JSON.stringify(config, null, 2)),
-        this.configDir,
-      );
+  async updateConfig(mutate: (config: SystemConfig) => void): Promise<SystemConfig> {
+    return this.enqueue(() =>
+      commitConfigUpdate(
+        async () => {
+          const config = await this.fetchConfig();
+          if (!config) return null;
+          return { config, version: String(this.generation) };
+        },
+        async (config, version) => {
+          if (version !== String(this.generation)) {
+            throw new ConfigVersionConflictError();
+          }
+          await this.writeConfig(config);
+        },
+        mutate,
+      ),
+    );
+  }
+
+  async saveConfigIfAbsent(config: SystemConfig): Promise<boolean> {
+    return this.enqueue(async () => {
+      const existing = await this.fetchConfig();
+      if (existing) return false;
+      await this.writeConfig(config);
       this._logger.info('Config saved locally.');
-    } catch (error) {
-      this._logger.error('Error saving config to local storage:', error);
-    }
+      return true;
+    });
+  }
+
+  async saveConfig(config: SystemConfig): Promise<void> {
+    await this.updateConfig((latest) => {
+      assignMergedSystemConfig(latest, config);
+    });
+    this._logger.info('Config saved locally.');
+  }
+
+  private async writeConfig(config: SystemConfig): Promise<void> {
+    await this.saveFile(
+      this.configFileName,
+      Buffer.from(JSON.stringify(config, null, 2)),
+      this.configDir,
+    );
+    this.generation += 1;
   }
 }

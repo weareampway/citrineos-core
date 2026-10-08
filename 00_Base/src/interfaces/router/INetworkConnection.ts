@@ -15,4 +15,6 @@ export interface INetworkConnection {
   shutdown(): Promise<void>;
 
   addWebsocketServer(websocketServerConfig: WebsocketServerConfig): Promise<void>;
+
+  removeWebsocketServer(serverId: string): Promise<void>;
 }
