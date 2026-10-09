@@ -49,11 +49,11 @@ export class SequelizeChargingStationSequenceRepository
     return await this.s.transaction(async (transaction) => {
       const [storedSequence, sequenceCreated] = await this.readOrCreateByQuery(tenantId, {
         where: {
-          tenantId: tenantId,
           stationId: stationId,
           type: type,
         },
         defaults: {
+          tenantId: tenantId,
           value: SequelizeChargingStationSequenceRepository.SEQUENCE_START,
         },
         transaction,

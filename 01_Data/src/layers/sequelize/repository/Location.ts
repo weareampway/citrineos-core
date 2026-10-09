@@ -247,10 +247,10 @@ export class SequelizeLocationRepository
       const [savedChargingStation, chargingStationCreated] =
         await this.chargingStation.readOrCreateByQuery(tenantId, {
           where: {
-            tenantId,
             id: chargingStation.id,
           },
           defaults: {
+            tenantId,
             locationId: chargingStation.locationId,
             chargePointVendor: chargingStation.chargePointVendor,
             chargePointModel: chargingStation.chargePointModel,

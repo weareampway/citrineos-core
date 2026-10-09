@@ -171,11 +171,11 @@ describe('SequelizeChargingStationSequenceRepository', () => {
 
       expect(readOrCreateSpy).toHaveBeenCalledWith(tenantId, {
         where: {
-          tenantId: tenantId,
           stationId: stationId,
           type: sequenceType,
         },
         defaults: {
+          tenantId: tenantId,
           value: 1,
         },
         transaction: mockTransaction,
