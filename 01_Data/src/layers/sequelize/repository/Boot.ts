@@ -41,11 +41,11 @@ export class SequelizeBootRepository extends SequelizeRepository<Boot> implement
     await this.s.transaction(async (sequelizeTransaction) => {
       const [boot, bootCreated] = await this.readOrCreateByQuery(tenantId, {
         where: {
-          tenantId,
           id: key,
         },
         defaults: {
           ...value,
+          tenantId,
         },
         transaction: sequelizeTransaction,
       });
