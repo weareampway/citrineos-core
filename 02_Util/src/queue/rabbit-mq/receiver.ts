@@ -46,6 +46,8 @@ export class RabbitMqReceiver extends AbstractMessageHandler {
   protected _cache: ICache;
   protected _channel?: amqplib.Channel;
   private _connectionHealth = new RabbitMqConnectionHealth();
+  private _connectionAttempt?: Promise<amqplib.Channel>;
+  private _channelRetirement: Promise<void> = Promise.resolve();
   private _abortReconnectController?: AbortController;
   private _circuitBreaker: CircuitBreaker;
   private _reconnectInterval?: NodeJS.Timeout;
@@ -73,8 +75,7 @@ export class RabbitMqReceiver extends AbstractMessageHandler {
       throw new Error('Circuit breaker is CLOSED. Cannot initialize RabbitMQ connection.');
     }
     this._abortReconnectController = new AbortController();
-    this._channel = await this._connectWithRetry(this._abortReconnectController.signal);
-    await this._resubscribeAll();
+    await this._connectWithRetry(this._abortReconnectController.signal);
   }
 
   /**
@@ -169,7 +170,15 @@ export class RabbitMqReceiver extends AbstractMessageHandler {
    * @param {AbortSignal} [abortSignal] - Optional abort signal to stop retrying.
    * @return {Promise<amqplib.Channel>} A promise that resolves to the AMQP channel.
    */
-  protected async _connectWithRetry(abortSignal?: AbortSignal): Promise<amqplib.Channel> {
+  protected _connectWithRetry(abortSignal?: AbortSignal): Promise<amqplib.Channel> {
+    // Initial connection, interval retries and breaker callbacks share one attempt.
+    this._connectionAttempt ??= this._connectAndSubscribeWithRetry(abortSignal).finally(() => {
+      this._connectionAttempt = undefined;
+    });
+    return this._connectionAttempt;
+  }
+
+  private async _connectAndSubscribeWithRetry(abortSignal?: AbortSignal): Promise<amqplib.Channel> {
     const url = this._config.util.messageBroker.amqp?.url;
     if (!url) {
       throw new Error('RabbitMQ URL is not configured');
@@ -183,15 +192,24 @@ export class RabbitMqReceiver extends AbstractMessageHandler {
         throw new Error('Circuit breaker is CLOSED. Cannot connect to RabbitMQ.');
       }
       try {
+        await this._channelRetirement;
         await retireRabbitChannel(this._channel);
         this._channel = undefined;
         const channel = await getSharedChannel(url);
         channel.on('error', (err) => {
-          this._logger.error('AMQP channel error', err);
-          this._handleDisconnect();
+          if (this._channel === channel) {
+            this._logger.error('AMQP channel error', err);
+            this._handleDisconnect();
+          }
         });
-        channel.on('close', () => this._handleDisconnect());
+        channel.on('close', () => {
+          if (this._channel === channel) this._handleDisconnect();
+        });
         this._channel = channel;
+        await this._resubscribeAll();
+        if (this._channel !== channel) {
+          throw new Error('RabbitMQ channel closed while restoring subscriptions.');
+        }
         this._connectionHealth.markConnected();
         this._circuitBreaker.triggerSuccess();
         return channel;
@@ -260,11 +278,8 @@ export class RabbitMqReceiver extends AbstractMessageHandler {
     this._reconnectInterval = setInterval(() => {
       this._logger.info('Attempting RabbitMQ reconnect due to circuit breaker CLOSED...');
       this._connectWithRetry()
-        .then(async (channel) => {
+        .then(() => {
           this._logger.info('RabbitMQ reconnect attempt succeeded.');
-          this._channel = channel;
-          await this._resubscribeAll();
-          this._circuitBreaker.triggerSuccess();
         })
         .catch((err) => {
           this._logger.error('RabbitMQ reconnect attempt failed.', err);
@@ -301,11 +316,8 @@ export class RabbitMqReceiver extends AbstractMessageHandler {
             'RabbitMQ channel missing while OPEN. Attempting to (re)initialize connection.',
           );
           this._connectWithRetry()
-            .then(async (channel) => {
+            .then(() => {
               this._logger.info('RabbitMQ connection (re)initialized.');
-              this._channel = channel;
-              await this._resubscribeAll();
-              this._circuitBreaker.triggerSuccess();
             })
             .catch((err) => {
               this._logger.error('RabbitMQ (re)init failed.', err);
@@ -334,12 +346,13 @@ export class RabbitMqReceiver extends AbstractMessageHandler {
    * Debounces concurrent reconnects.
    */
   private _handleDisconnect() {
-    if (!this._connectionHealth.beginDisconnect()) {
-      return;
-    }
+    const firstDisconnect = this._connectionHealth.beginDisconnect();
     const previous = this._channel;
     this._channel = undefined;
-    void retireRabbitChannel(previous);
+    this._channelRetirement = retireRabbitChannel(previous);
+    if (!firstDisconnect) {
+      return;
+    }
     this._logger.warn('RabbitMQ connection lost. Triggering circuit breaker failure.');
     this._circuitBreaker.triggerFailure('RabbitMQ connection lost');
     if (this._circuitBreaker.state === 'CLOSED') {
@@ -436,6 +449,7 @@ export class RabbitMqReceiver extends AbstractMessageHandler {
           `Failed to resubscribe RabbitMQ queue for ${sub.identifier}; messaging may be broken until reconnect.`,
           err,
         );
+        throw err;
       }
     }
   }
