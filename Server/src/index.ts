@@ -71,6 +71,7 @@ import {
   OIDCAuthProvider,
   RabbitMqReceiver,
   RabbitMqSender,
+  rabbitMqClientsAreUnhealthy,
   RealTimeAuthorizer,
   RedisCache,
   UnknownStationFilter,
@@ -102,6 +103,7 @@ export class CitrineOSServer {
   private readonly _fileStorage: IFileStorage;
   private readonly modules: IModule[] = [];
   private readonly apis: IModuleApi[] = [];
+  private readonly _rabbitClients: Array<{ disconnectedSince: Date | null }> = [];
   private _sequelizeInstance!: Sequelize;
   private host?: string;
   private port?: number;
@@ -254,15 +256,25 @@ export class CitrineOSServer {
   }
 
   protected _createSender(): IMessageSender {
-    return new RabbitMqSender(this._config, this._logger);
+    const sender = new RabbitMqSender(this._config, this._logger);
+    this._rabbitClients.push(sender);
+    return sender;
   }
 
   protected _createHandler(): IMessageHandler {
-    return new RabbitMqReceiver(this._config, this._logger);
+    const receiver = new RabbitMqReceiver(this._config, this._logger);
+    this._rabbitClients.push(receiver);
+    return receiver;
   }
 
   private initHealthCheck() {
-    this._server.get('/health', async () => ({ status: 'healthy' }));
+    this._server.get('/health', async (_request, reply) => {
+      if (rabbitMqClientsAreUnhealthy(this._rabbitClients, new Date())) {
+        reply.code(503);
+        return { status: 'unhealthy' };
+      }
+      return { status: 'healthy' };
+    });
   }
 
   private initAjv(ajv?: Ajv.Ajv) {

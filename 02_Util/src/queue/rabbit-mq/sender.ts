@@ -13,6 +13,7 @@ import type {
 import { AbstractMessageSender, CircuitBreaker, MessageState, OcppError } from '@citrineos/base';
 import * as amqplib from 'amqplib';
 import { instanceToPlain } from 'class-transformer';
+import { RabbitMqConnectionHealth, retireRabbitChannel } from './connection-health.js';
 import { getSharedChannel } from './shared-connection-pool.js';
 import type { ILogObj } from 'tslog';
 import { Logger } from 'tslog';
@@ -31,7 +32,7 @@ export class RabbitMqSender extends AbstractMessageSender implements IMessageSen
    * Fields
    */
   protected _channel?: amqplib.Channel;
-  private _reconnecting = false;
+  private _connectionHealth = new RabbitMqConnectionHealth();
   private _abortReconnectController?: AbortController;
   private _circuitBreaker: CircuitBreaker;
   private _reconnectInterval?: NodeJS.Timeout;
@@ -158,6 +159,10 @@ export class RabbitMqSender extends AbstractMessageSender implements IMessageSen
     return Promise.resolve();
   }
 
+  get disconnectedSince(): Date | null {
+    return this._connectionHealth.disconnectedSince;
+  }
+
   /**
    * Protected Methods
    */
@@ -183,16 +188,21 @@ export class RabbitMqSender extends AbstractMessageSender implements IMessageSen
         throw new Error('Circuit breaker is CLOSED. Cannot connect to RabbitMQ.');
       }
       try {
+        await retireRabbitChannel(this._channel);
+        this._channel = undefined;
         const channel = await getSharedChannel(url);
         channel.on('error', (err) => {
           this._logger.error('AMQP channel error', err);
           this._handleDisconnect();
         });
         channel.on('close', () => this._handleDisconnect());
+        this._channel = channel;
+        this._connectionHealth.markConnected();
         this._circuitBreaker.triggerSuccess();
         return channel;
       } catch (err) {
         this._logger.error('RabbitMQ connect failed, triggering circuit breaker failure', err);
+        this._connectionHealth.noteDisconnected();
         this._circuitBreaker.triggerFailure((err as Error)?.message);
         await new Promise((res) => setTimeout(res, 1000));
       }
@@ -281,9 +291,14 @@ export class RabbitMqSender extends AbstractMessageSender implements IMessageSen
    * This method will attempt to reconnect to RabbitMQ when the connection is lost.
    * Debounces concurrent reconnects.
    */
-  private async _handleDisconnect() {
-    this._logger.warn('RabbitMQ connection lost. Triggering circuit breaker failure.');
+  private _handleDisconnect() {
+    if (!this._connectionHealth.beginDisconnect()) {
+      return;
+    }
+    const previous = this._channel;
     this._channel = undefined;
+    void retireRabbitChannel(previous);
+    this._logger.warn('RabbitMQ connection lost. Triggering circuit breaker failure.');
     this._circuitBreaker.triggerFailure('RabbitMQ connection lost');
   }
 }
