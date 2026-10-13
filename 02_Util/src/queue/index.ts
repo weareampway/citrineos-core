@@ -4,6 +4,7 @@
 
 export { RabbitMqReceiver } from './rabbit-mq/receiver.js';
 export { RabbitMqSender } from './rabbit-mq/sender.js';
+export { rabbitMqClientsAreUnhealthy } from './rabbit-mq/connection-health.js';
 
 export { KafkaReceiver } from './kafka/receiver.js';
 export { KafkaSender } from './kafka/sender.js';
