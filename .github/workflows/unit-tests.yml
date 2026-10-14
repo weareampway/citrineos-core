@@ -9,16 +9,6 @@ on:
 jobs:
   tests:
     runs-on: ubuntu-latest
-    services:
-      rabbitmq:
-        image: rabbitmq:4.2-alpine
-        ports:
-          - 5672:5672
-        options: >-
-          --health-cmd "rabbitmq-diagnostics -q ping"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 12
 
     steps:
       - name: Checkout repository
@@ -27,7 +17,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '24.4.1'
+          node-version: "24.4.1"
 
       - name: Cache Node.js modules
         uses: actions/cache@v4
@@ -45,6 +35,5 @@ jobs:
 
       - name: Run tests
         env:
-          NODE_OPTIONS: '--max_old_space_size=4096'
-          RABBITMQ_TEST_URL: 'amqp://127.0.0.1:5672'
+          NODE_OPTIONS: "--max_old_space_size=4096"
         run: npm test
