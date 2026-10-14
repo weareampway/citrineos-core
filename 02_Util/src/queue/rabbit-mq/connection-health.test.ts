@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { Channel } from 'amqplib';
 import {
   RABBITMQ_DISCONNECT_UNHEALTHY_MS,
@@ -56,6 +56,7 @@ describe('retireRabbitChannel', () => {
   it('removes listeners and closes the channel', async () => {
     const channel = {
       removeAllListeners: vi.fn(),
+      on: vi.fn(),
       close: vi.fn().mockResolvedValue(undefined),
     } as unknown as Channel;
 
@@ -69,9 +70,25 @@ describe('retireRabbitChannel', () => {
   it('ignores a channel the broker already closed', async () => {
     const channel = {
       removeAllListeners: vi.fn(),
+      on: vi.fn(),
       close: vi.fn().mockRejectedValue(new Error('Channel closed')),
     } as unknown as Channel;
 
     await expect(retireRabbitChannel(channel)).resolves.toBeUndefined();
+  });
+});
+
+describe('bounded channel retirement', () => {
+  afterEach(() => vi.useRealTimers());
+  it('allows recovery when the old broker never acknowledges channel.close', async () => {
+    vi.useFakeTimers();
+    const channel = {
+      removeAllListeners: vi.fn(),
+      on: vi.fn(),
+      close: vi.fn(() => new Promise(() => {})),
+    } as unknown as Channel;
+    const retiring = retireRabbitChannel(channel);
+    await vi.advanceTimersByTimeAsync(5_000);
+    await expect(retiring).resolves.toBeUndefined();
   });
 });

@@ -95,3 +95,53 @@ describe('RabbitMqReceiver recovery health', () => {
     expect(rabbitMqClientsAreUnhealthy([receiver], new Date())).toBe(false);
   });
 });
+
+describe('receiver shutdown and immediate recovery', () => {
+  const config = {
+    maxReconnectDelay: 30,
+    util: { messageBroker: { amqp: { url: 'amqp://test', exchange: 'ocpp' } } },
+  } as SystemConfig;
+
+  it('reconnects immediately without waiting for the periodic retry', async () => {
+    vi.mocked(getSharedChannel).mockReset();
+    const receiver = new TestReceiver(config, new Logger({ minLevel: 7 }));
+    const initial = channel();
+    const restored = channel();
+    vi.mocked(getSharedChannel)
+      .mockResolvedValueOnce(initial as unknown as Channel)
+      .mockResolvedValueOnce(restored as unknown as Channel);
+    await receiver.initConnection();
+    initial.emit('close');
+    await receiver.reconnect();
+    expect(getSharedChannel).toHaveBeenCalledTimes(2);
+    expect(receiver.disconnectedSince).toBeNull();
+    await receiver.shutdown();
+    await expect(receiver.reconnect()).rejects.toThrow('aborted');
+  });
+
+  it('never marks a consumer healthy when shutdown occurred during resubscription', async () => {
+    vi.mocked(getSharedChannel).mockReset();
+    const receiver = new TestReceiver(config, new Logger({ minLevel: 7 }));
+    const initial = channel();
+    vi.mocked(getSharedChannel).mockResolvedValueOnce(initial as unknown as Channel);
+    await receiver.initConnection();
+    await receiver.subscribe('Transactions');
+    const restored = channel();
+    let finishConsume!: () => void;
+    restored.consume.mockImplementation(
+      () =>
+        new Promise<void>((resolve) => {
+          finishConsume = resolve;
+        }),
+    );
+    vi.mocked(getSharedChannel).mockResolvedValueOnce(restored as unknown as Channel);
+    initial.emit('close');
+    const failed = expect(receiver.reconnect()).rejects.toThrow();
+    await vi.waitFor(() => expect(restored.consume).toHaveBeenCalledOnce());
+    await receiver.shutdown();
+    finishConsume();
+    await failed;
+    expect(receiver.disconnectedSince).not.toBeNull();
+    expect(restored.close).toHaveBeenCalledOnce();
+  });
+});

@@ -56,9 +56,19 @@ export async function retireRabbitChannel(channel: Channel | undefined): Promise
   }
   channel.removeAllListeners('error');
   channel.removeAllListeners('close');
+  // Error events can arrive after retirement; keep them from becoming uncaught.
+  channel.on('error', () => {});
+  let timeout: ReturnType<typeof setTimeout> | undefined;
   try {
-    await channel.close();
+    await Promise.race([
+      channel.close(),
+      new Promise<void>((resolve) => {
+        timeout = setTimeout(resolve, 5_000);
+      }),
+    ]);
   } catch {
-    // The broker already closed it. Closing again is how the leak was avoided.
+    // Already closed by the broker.
+  } finally {
+    if (timeout) clearTimeout(timeout);
   }
 }

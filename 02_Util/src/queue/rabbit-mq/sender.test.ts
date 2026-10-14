@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { EventEmitter } from 'node:events';
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { CircuitBreaker, SystemConfig } from '@citrineos/base';
 import type { Channel } from 'amqplib';
 import { type ILogObj, Logger } from 'tslog';
@@ -11,7 +11,19 @@ import { getSharedChannel } from './shared-connection-pool.js';
 
 vi.mock('./shared-connection-pool.js', () => ({ getSharedChannel: vi.fn() }));
 
+const senders: TestSender[] = [];
+beforeEach(() => {
+  vi.mocked(getSharedChannel).mockReset();
+});
+afterEach(async () => {
+  await Promise.all(senders.splice(0).map((sender) => sender.shutdown()));
+});
+
 class TestSender extends RabbitMqSender {
+  constructor(...args: ConstructorParameters<typeof RabbitMqSender>) {
+    super(...args);
+    senders.push(this);
+  }
   reconnect() {
     return this._connectWithRetry();
   }
@@ -102,5 +114,45 @@ describe('RabbitMqSender channel retirement', () => {
     staleClose();
     await Promise.resolve();
     expect(replacement.close).not.toHaveBeenCalled();
+  });
+});
+
+describe('sender single-flight lifecycle', () => {
+  it('shares a pending connect attempt between concurrent callers', async () => {
+    let complete!: (value: Channel) => void;
+    vi.mocked(getSharedChannel).mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          complete = resolve;
+        }),
+    );
+    const sender = new TestSender(config, new Logger({ minLevel: 7 }), breaker());
+    const first = sender.reconnect();
+    expect(sender.reconnect()).toBe(first);
+    await vi.waitFor(() => expect(getSharedChannel).toHaveBeenCalledOnce());
+    const connected = channel();
+    complete(connected as unknown as Channel);
+    await first;
+    expect(connected.close).not.toHaveBeenCalled();
+  });
+
+  it('retires a connection arriving after shutdown instead of reviving the sender', async () => {
+    let complete!: (value: Channel) => void;
+    vi.mocked(getSharedChannel).mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          complete = resolve;
+        }),
+    );
+    const circuit = breaker();
+    const sender = new TestSender(config, new Logger({ minLevel: 7 }), circuit);
+    const failed = expect(sender.reconnect()).rejects.toThrow('aborted');
+    await vi.waitFor(() => expect(getSharedChannel).toHaveBeenCalledOnce());
+    await sender.shutdown();
+    const late = channel();
+    complete(late as unknown as Channel);
+    await failed;
+    expect(late.close).toHaveBeenCalledOnce();
+    expect(circuit.triggerSuccess).not.toHaveBeenCalled();
   });
 });
