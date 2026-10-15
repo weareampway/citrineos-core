@@ -107,7 +107,14 @@ export class SequelizeLocationRepository
   }
 
   async doesChargingStationExistByStationId(tenantId: number, stationId: string): Promise<boolean> {
-    return await this.chargingStation.existsByKey(tenantId, stationId);
+    // Station IDs are globally unique, but existence alone does not authorize a connection
+    // on another tenant's listener. The generic existsByKey only checks the primary key.
+    return (
+      (await ChargingStation.findOne({
+        attributes: ['id'],
+        where: { id: stationId, tenantId },
+      })) !== null
+    );
   }
 
   async addStatusNotificationToChargingStation(
