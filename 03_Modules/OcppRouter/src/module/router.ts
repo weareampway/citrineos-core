@@ -177,6 +177,13 @@ export class MessageRouterImpl extends AbstractMessageRouter implements IMessage
       this._logger.error('_webhookDispatcher deregister failed', err);
     });
 
+    // Unsubscribe before the DB calls: if one fails, this instance must not keep
+    // consuming the station's queue after the station has moved to another one.
+    const connectionIdentifier = createIdentifier(tenantId, stationId);
+    // TODO: ensure that all queue implementations in 02_Util only unsubscribe 1 queue per call
+    // ...which will require refactoring this method to unsubscribe request and response queues separately
+    const unsubscribed = await this._handler.unsubscribe(connectionIdentifier);
+
     let protocol: OCPPVersion | null = null;
     try {
       const chargingStation = await this._locationRepository.readChargingStationByStationId(
@@ -199,10 +206,7 @@ export class MessageRouterImpl extends AbstractMessageRouter implements IMessage
       protocol,
     );
 
-    const connectionIdentifier = createIdentifier(tenantId, stationId);
-    // TODO: ensure that all queue implementations in 02_Util only unsubscribe 1 queue per call
-    // ...which will require refactoring this method to unsubscribe request and response queues separately
-    return await this._handler.unsubscribe(connectionIdentifier);
+    return unsubscribed;
   }
 
   async onMessage(
