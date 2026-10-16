@@ -107,7 +107,29 @@ export class SequelizeLocationRepository
   }
 
   async doesChargingStationExistByStationId(tenantId: number, stationId: string): Promise<boolean> {
-    return await this.chargingStation.existsByKey(tenantId, stationId);
+    // Station IDs are globally unique, but existence alone does not authorize a connection
+    // on another tenant's listener. The generic existsByKey only checks the primary key.
+    const station = await ChargingStation.findOne({
+      attributes: ['id'],
+      where: { id: stationId, tenantId },
+    });
+    if (station !== null) {
+      return true;
+    }
+
+    // Diagnose a wrong listener only after rejection; successful connections need one query.
+    // Keep ownership details in the server log, not in the websocket rejection sent to the client.
+    const foreignStation = await ChargingStation.findOne({
+      attributes: ['tenantId'],
+      where: { id: stationId, tenantId: { [Op.ne]: tenantId } },
+    });
+    if (foreignStation !== null) {
+      this.logger.warn(
+        `Charging station ${stationId} belongs to tenant ${foreignStation.tenantId}, but connected through listener for tenant ${tenantId}`,
+        { stationId, stationTenantId: foreignStation.tenantId, listenerTenantId: tenantId },
+      );
+    }
+    return false;
   }
 
   async addStatusNotificationToChargingStation(
