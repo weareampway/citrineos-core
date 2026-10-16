@@ -56,6 +56,7 @@ describe('retireRabbitChannel', () => {
   it('removes listeners and closes the channel', async () => {
     const channel = {
       removeAllListeners: vi.fn(),
+      on: vi.fn(),
       close: vi.fn().mockResolvedValue(undefined),
     } as unknown as Channel;
 
@@ -69,6 +70,7 @@ describe('retireRabbitChannel', () => {
   it('ignores a channel the broker already closed', async () => {
     const channel = {
       removeAllListeners: vi.fn(),
+      on: vi.fn(),
       close: vi.fn().mockRejectedValue(new Error('Channel closed')),
     } as unknown as Channel;
 

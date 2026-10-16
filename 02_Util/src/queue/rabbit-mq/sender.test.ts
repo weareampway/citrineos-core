@@ -2,16 +2,28 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { EventEmitter } from 'node:events';
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { CircuitBreaker, SystemConfig } from '@citrineos/base';
 import type { Channel } from 'amqplib';
-import { Logger } from 'tslog';
+import { type ILogObj, Logger } from 'tslog';
 import { RabbitMqSender } from './sender.js';
 import { getSharedChannel } from './shared-connection-pool.js';
 
 vi.mock('./shared-connection-pool.js', () => ({ getSharedChannel: vi.fn() }));
 
+const senders: TestSender[] = [];
+beforeEach(() => {
+  vi.mocked(getSharedChannel).mockReset();
+});
+afterEach(async () => {
+  await Promise.all(senders.splice(0).map((sender) => sender.shutdown()));
+});
+
 class TestSender extends RabbitMqSender {
+  constructor(...args: ConstructorParameters<typeof RabbitMqSender>) {
+    super(...args);
+    senders.push(this);
+  }
   reconnect() {
     return this._connectWithRetry();
   }
@@ -39,7 +51,7 @@ const config = {
 
 describe('RabbitMqSender channel retirement', () => {
   it('closes the channel it disconnects from and waits for that close before opening another', async () => {
-    const logger = new Logger({ minLevel: 7 });
+    const logger = new Logger<ILogObj>({ minLevel: 7 });
     const initial = channel();
     let finishClose!: () => void;
     initial.close.mockImplementation(
@@ -70,7 +82,7 @@ describe('RabbitMqSender channel retirement', () => {
   });
 
   it('reports one connection loss when the same channel reports two errors', async () => {
-    const logger = new Logger({ minLevel: 7 });
+    const logger = new Logger<ILogObj>({ minLevel: 7 });
     const circuit = breaker();
     const initial = channel();
     vi.mocked(getSharedChannel).mockResolvedValueOnce(initial as unknown as Channel);
@@ -86,7 +98,7 @@ describe('RabbitMqSender channel retirement', () => {
   });
 
   it('does not retire the replacement when the previous channel closes late', async () => {
-    const logger = new Logger({ minLevel: 7 });
+    const logger = new Logger<ILogObj>({ minLevel: 7 });
     const initial = channel();
     vi.mocked(getSharedChannel).mockResolvedValueOnce(initial as unknown as Channel);
     const sender = new TestSender(config, logger, breaker());
