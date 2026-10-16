@@ -121,6 +121,54 @@ describe('WebsocketNetworkConnection server deletion', () => {
     expect(deregisterConnection).not.toHaveBeenCalledWith(1, 'charger-2');
   });
 
+  it('registers a reconnecting charger only after its previous deregistration finished', async () => {
+    const config = await startServer('3');
+    const first = await connectCharger(config);
+    let finishDeregistration!: (value: boolean) => void;
+    const deregistration = new Promise<boolean>((resolve) => {
+      finishDeregistration = resolve;
+    });
+    deregisterConnection.mockImplementation(() => deregistration);
+    first.close();
+    await vi.waitFor(() => expect(deregisterConnection).toHaveBeenCalledWith(1, 'charger-3'));
+
+    await connectCharger(config);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(registerConnection).toHaveBeenCalledOnce();
+
+    finishDeregistration(true);
+    await vi.waitFor(() => expect(registerConnection).toHaveBeenCalledTimes(2));
+  });
+
+  it('deregisters a charger whose registration fails partway', async () => {
+    registerConnection.mockResolvedValue(false);
+    await connectCharger(await startServer('7'));
+
+    await vi.waitFor(() => expect(deregisterConnection).toHaveBeenCalledWith(1, 'charger-7'));
+  });
+
+  it('deregisters a charger whose socket closed while it was being registered', async () => {
+    let finishRegistration!: (value: boolean) => void;
+    const registration = new Promise<boolean>((resolve) => {
+      finishRegistration = resolve;
+    });
+    registerConnection.mockImplementation(() => registration);
+    await connectCharger(await startServer('8'));
+    await vi.waitFor(() =>
+      expect(registerConnection).toHaveBeenCalledWith(1, 'charger-8', 'ocpp1.6'),
+    );
+
+    const internals = connection as unknown as { _identifierConnections: Map<string, WebSocket> };
+    const serverSide = internals._identifierConnections.get('1:charger-8')!;
+    serverSide.terminate();
+    await vi.waitFor(() => expect(serverSide.readyState).toBe(WebSocket.CLOSED));
+    expect(deregisterConnection).not.toHaveBeenCalledWith(1, 'charger-8');
+
+    finishRegistration(true);
+    await vi.waitFor(() => expect(deregisterConnection).toHaveBeenCalledWith(1, 'charger-8'));
+    expect(internals._identifierConnections.has('1:charger-8')).toBe(false);
+  });
+
   it('closes sockets whose websocket authentication is still pending', async () => {
     let authenticationStarted!: () => void;
     const authenticating = new Promise<void>((resolve) => {

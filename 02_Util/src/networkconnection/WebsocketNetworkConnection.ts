@@ -35,6 +35,7 @@ export class WebsocketNetworkConnection implements INetworkConnection {
   protected _config: SystemConfig;
   protected _logger: Logger<ILogObj>;
   private _identifierConnections: Map<string, WebSocket> = new Map();
+  private readonly _deregistrations = new Map<string, Promise<void>>();
   // websocketServers id as key and http server as value
   private _httpServersMap: Map<string, http.Server | https.Server>;
   private readonly _serverSockets = new WeakMap<http.Server | https.Server, Set<Socket>>();
@@ -124,9 +125,29 @@ export class WebsocketNetworkConnection implements INetworkConnection {
       );
     }
     websocketConnection?.close(1000, 'Disconnected by admin request');
-    const deregistered = await this._router?.deregisterConnection(tenantId, stationId);
+    const deregistration = this._router?.deregisterConnection(tenantId, stationId);
+    if (deregistration) this._trackDeregistration(identifier, deregistration);
+    const deregistered = await deregistration;
 
     return !!websocketConnection && deregistered;
+  }
+
+  /**
+   * Remembers a running deregistration so that a reconnect of the same station waits
+   * for it; otherwise its late unsubscribe would cancel the new connection's consumers.
+   */
+  private _trackDeregistration(identifier: string, deregistration: Promise<boolean>): void {
+    const tracked: Promise<void> = Promise.all([
+      this._deregistrations.get(identifier),
+      deregistration.catch((error) => {
+        this._logger.error('Failed to deregister websocket client', identifier, error);
+      }),
+    ]).then(() => {
+      if (this._deregistrations.get(identifier) === tracked) {
+        this._deregistrations.delete(identifier);
+      }
+    });
+    this._deregistrations.set(identifier, tracked);
   }
 
   async shutdown(): Promise<void> {
@@ -318,6 +339,8 @@ export class WebsocketNetworkConnection implements INetworkConnection {
         const port = req.socket.remotePort as number;
         this._logger.info('Client websocket connected', identifier, ip, port, ws.protocol);
 
+        await this._deregistrations.get(identifier);
+
         // Register client
         const websocketConnection: IWebsocketConnection = {
           id: websocketServerConfig.id,
@@ -335,6 +358,13 @@ export class WebsocketNetworkConnection implements INetworkConnection {
           throw new Error('Failed to register websocket client');
         }
 
+        if (ws.readyState === WebSocket.CLOSED) {
+          // Its close event fired before the close handler below was attached.
+          this._logger.info('Connection closed during registration for', identifier);
+          this._deregisterIfCurrent(identifier, ws);
+          return;
+        }
+
         this._logger.info('Successfully connected new charging station.', identifier);
 
         // Register all websocket events
@@ -345,8 +375,28 @@ export class WebsocketNetworkConnection implements INetworkConnection {
       } catch (error) {
         this._logger.fatal('Failed to subscribe to message broker for ', identifier);
         ws.close(1011, 'Failed to subscribe to message broker for ' + identifier);
+        // registerConnection may have subscribed or marked the station online before failing.
+        this._deregisterIfCurrent(identifier, ws);
       }
     }
+  }
+
+  /**
+   * Deregisters the station unless a newer connection has already replaced this socket.
+   */
+  private _deregisterIfCurrent(identifier: string, ws: WebSocket): void {
+    if (this._identifierConnections.get(identifier) !== ws) {
+      return;
+    }
+    this._cache.remove(identifier, CacheNamespace.Connections);
+    this._identifierConnections.delete(identifier);
+    this._trackDeregistration(
+      identifier,
+      this._router.deregisterConnection(
+        getTenantIdFromIdentifier(identifier),
+        getStationIdFromIdentifier(identifier),
+      ),
+    );
   }
 
   /**
@@ -374,15 +424,7 @@ export class WebsocketNetworkConnection implements INetworkConnection {
 
     ws.once('close', () => {
       this._logger.info('Connection closed for', identifier);
-      if (this._identifierConnections.get(identifier) !== ws) {
-        return;
-      }
-      this._cache.remove(identifier, CacheNamespace.Connections);
-      this._identifierConnections.delete(identifier);
-      this._router.deregisterConnection(
-        getTenantIdFromIdentifier(identifier),
-        getStationIdFromIdentifier(identifier),
-      );
+      this._deregisterIfCurrent(identifier, ws);
     });
 
     ws.on('ping', async (message) => {

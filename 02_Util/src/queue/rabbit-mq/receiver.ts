@@ -2,16 +2,9 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-import type {
-  CallAction,
-  CircuitBreakerState,
-  ICache,
-  IModule,
-  SystemConfig,
-} from '@citrineos/base';
+import type { CallAction, CircuitBreakerState, IModule, SystemConfig } from '@citrineos/base';
 import {
   AbstractMessageHandler,
-  CacheNamespace,
   CircuitBreaker,
   Message,
   RetryMessageError,
@@ -21,7 +14,6 @@ import type { ILogObj } from 'tslog';
 import { RabbitMqConnectionHealth, retireRabbitChannel } from './connection-health.js';
 import { getSharedChannel } from './shared-connection-pool.js';
 import { Logger } from 'tslog';
-import { MemoryCache } from '../../index.js';
 
 /**
  * Implementation of a {@link IMessageHandler} using RabbitMQ as the underlying transport.
@@ -30,20 +22,48 @@ type SubscriptionRegistration = {
   identifier: string;
   actions?: CallAction[];
   filter?: { [k: string]: string };
+  /** The consumer this process created, with the channel it lives on. */
+  consumer?: { channel: amqplib.Channel; tag: string };
+  /** Settles when the subscribe that created this registration has finished. */
+  ready?: Promise<boolean>;
 };
+
+function isSameSubscription(
+  sub: SubscriptionRegistration,
+  identifier: string,
+  actions?: CallAction[],
+  filter?: { [k: string]: string },
+): boolean {
+  return (
+    sub.identifier === identifier &&
+    JSON.stringify(sub.actions) === JSON.stringify(actions) &&
+    JSON.stringify(sub.filter) === JSON.stringify(filter)
+  );
+}
 
 export class RabbitMqReceiver extends AbstractMessageHandler {
   /**
    * Constants
    */
   private static readonly DEFAULT_QUEUE_PREFIX = 'rabbit_queue_';
-  private static readonly CACHE_PREFIX = 'rabbit_subscription_';
   private static readonly RECONNECT_DELAY = 5000;
+  /**
+   * Station queues are shared by every instance the station may connect to. They
+   * expire after this long without consumers instead of being deleted with the last
+   * one: cancelling it while another subscribe has already declared the queue would
+   * make that subscribe's bind or consume fail with a 404, which closes its channel.
+   */
+  private static readonly STATION_QUEUE_EXPIRES_MS = 30_000;
+  /**
+   * RabbitMQ rejects redeclaring a queue with other arguments (406, closes the
+   * channel), so expiring station queues must not share names with the autoDelete
+   * queues that older instances still declare during a rolling deploy.
+   */
+  private static readonly STATION_QUEUE_INFIX = 'exp_';
 
   /**
    * Fields
    */
-  protected _cache: ICache;
   protected _channel?: amqplib.Channel;
   private _connectionHealth = new RabbitMqConnectionHealth();
   private _connectionAttempt?: Promise<amqplib.Channel>;
@@ -58,11 +78,9 @@ export class RabbitMqReceiver extends AbstractMessageHandler {
     config: SystemConfig,
     logger?: Logger<ILogObj>,
     module?: IModule,
-    cache?: ICache,
     circuitBreaker?: CircuitBreaker,
   ) {
     super(config, logger, module);
-    this._cache = cache || new MemoryCache();
     this._circuitBreaker = circuitBreaker ?? new CircuitBreaker();
     this._circuitBreaker.onStateChange(this._onCircuitBreakerStateChange.bind(this));
   }
@@ -109,48 +127,44 @@ export class RabbitMqReceiver extends AbstractMessageHandler {
       return true;
     }
 
-    const ok = await this._performSubscribe(identifier, actions, filter);
-    if (ok) {
-      this._subscriptionRegistry.push({ identifier, actions, filter });
+    // A station that reconnects while its old socket is still open subscribes again
+    // without being deregistered; reuse the registration instead of adding a consumer.
+    const existing = this._subscriptionRegistry.find((s) =>
+      isSameSubscription(s, identifier, actions, filter),
+    );
+    if (existing) {
+      return existing.ready!;
     }
-    return ok;
+
+    // Registered before subscribing, so an unsubscribe that runs meanwhile sees it.
+    const sub: SubscriptionRegistration = { identifier, actions, filter };
+    this._subscriptionRegistry.push(sub);
+    sub.ready = this._performSubscribe(sub).catch(async (err) => {
+      this._subscriptionRegistry = this._subscriptionRegistry.filter((s) => s !== sub);
+      // A resubscribe on a newer channel may have created a consumer meanwhile.
+      await this._cancelConsumer(sub);
+      throw err;
+    });
+    return sub.ready;
   }
 
-  unsubscribe(identifier: string): Promise<boolean> {
+  /**
+   * Cancels only the consumers this process created. Deleting the queue would also
+   * cancel the consumers of every other instance the station has moved to, and a
+   * second delete of the same name is a 404 that closes the channel.
+   *
+   * @return false if a consumer could not be cancelled.
+   */
+  async unsubscribe(identifier: string): Promise<boolean> {
+    const removed = this._subscriptionRegistry.filter((s) => s.identifier === identifier);
     this._subscriptionRegistry = this._subscriptionRegistry.filter(
       (s) => s.identifier !== identifier,
     );
-    const cacheKey = `${RabbitMqReceiver.CACHE_PREFIX}${identifier}`;
-    return this._cache
-      .get<Array<string>>(cacheKey, CacheNamespace.Other, () => Array<string>)
-      .then(async (queues) => {
-        if (queues) {
-          if (!this._channel) {
-            throw new Error('RabbitMQ is down: cannot unsubscribe.');
-          }
-          const channel = this._channel;
-          this._channel = channel;
-          for (const queue of queues) {
-            await channel.unbindQueue(
-              queue,
-              this._config.util.messageBroker.amqp?.exchange || '',
-              '',
-            );
-            const messageCount = await this._channel?.deleteQueue(queue);
-            this._logger.info(
-              `Queue ${identifier} deleted with ${messageCount?.messageCount} messages remaining.`,
-            );
-          }
-          // Remove the cache entry after successfully deleting all queues
-          await this._cache.remove(cacheKey, CacheNamespace.Other);
-          return true;
-        } else {
-          this._logger.warn(
-            `Failed to delete queue for ${identifier}, queue name not found in cache.`,
-          );
-          return false;
-        }
-      });
+    let ok = true;
+    for (const sub of removed) {
+      if (!(await this._cancelConsumer(sub))) ok = false;
+    }
+    return ok;
   }
 
   async shutdown(): Promise<void> {
@@ -377,16 +391,18 @@ export class RabbitMqReceiver extends AbstractMessageHandler {
     }
   }
 
-  private async _performSubscribe(
-    identifier: string,
-    actions?: CallAction[],
-    filter?: { [k: string]: string },
-  ): Promise<boolean> {
+  private async _performSubscribe(sub: SubscriptionRegistration): Promise<boolean> {
+    const { identifier, actions, filter } = sub;
     const exchange = this._config.util.messageBroker.amqp?.exchange as string;
     const queuePrefix =
       (this._config.util.messageBroker.amqp as { queuePrefix?: string } | undefined)?.queuePrefix ??
       RabbitMqReceiver.DEFAULT_QUEUE_PREFIX;
-    const queueName = `${queuePrefix}${identifier}`;
+    // Stations subscribe without actions (see subscribe). Module queues keep autoDelete:
+    // renamed, every module message would reach old and new instances during a deploy.
+    const stationQueue = !actions;
+    const queueName = stationQueue
+      ? `${queuePrefix}${RabbitMqReceiver.STATION_QUEUE_INFIX}${identifier}`
+      : `${queuePrefix}${identifier}`;
 
     const filterWithMatch = filter
       ? {
@@ -401,11 +417,12 @@ export class RabbitMqReceiver extends AbstractMessageHandler {
     const channel = this._channel;
 
     await channel.assertExchange(exchange, 'headers', { durable: false });
-    await channel.assertQueue(queueName, {
-      durable: false,
-      autoDelete: true,
-      exclusive: false,
-    });
+    await channel.assertQueue(
+      queueName,
+      stationQueue
+        ? { durable: false, exclusive: false, expires: RabbitMqReceiver.STATION_QUEUE_EXPIRES_MS }
+        : { durable: false, autoDelete: true, exclusive: false },
+    );
 
     if (actions && actions.length > 0) {
       for (const action of actions) {
@@ -427,40 +444,83 @@ export class RabbitMqReceiver extends AbstractMessageHandler {
       );
     }
 
-    await channel.consume(queueName, (msg) => this._onMessage(msg, channel));
+    const { consumerTag } = await channel.consume(queueName, (msg) => {
+      if (msg === null) {
+        this._onConsumerCancelled(sub, channel);
+        return;
+      }
+      return this._onMessage(msg, channel);
+    });
+    const wanted = this._subscriptionRegistry.includes(sub);
+    if (this._channel !== channel) {
+      // The consumer died with its channel; a resubscribe restores the registration.
+      return wanted;
+    }
+    sub.consumer = { channel, tag: consumerTag };
+    if (!wanted) {
+      // Unsubscribed while this consumer was being created.
+      await this._cancelConsumer(sub);
+    }
+    return wanted;
+  }
 
-    const cacheKey = `${RabbitMqReceiver.CACHE_PREFIX}${identifier}`;
+  /**
+   * Cancels the registration's consumer if it lives on the current channel; one on a
+   * replaced channel died with it.
+   *
+   * @return false if the cancel failed.
+   */
+  private async _cancelConsumer(sub: SubscriptionRegistration): Promise<boolean> {
+    const consumer = sub.consumer;
+    sub.consumer = undefined;
+    if (!consumer || consumer.channel !== this._channel) {
+      return true;
+    }
+    try {
+      await consumer.channel.cancel(consumer.tag);
+      return true;
+    } catch (error) {
+      this._logger.warn(`Failed to cancel RabbitMQ consumer for ${sub.identifier}`, error);
+      return false;
+    }
+  }
 
-    const cachedQueues = await this._cache
-      .get<Array<string>>(cacheKey, CacheNamespace.Other, () => Array<string>)
-      .then((value) => {
-        if (value) {
-          value.push(queueName);
-          return value;
-        }
-        return new Array<string>(queueName);
-      });
-
-    await this._cache.set(cacheKey, JSON.stringify(cachedQueues), CacheNamespace.Other);
-
-    return true;
+  /**
+   * The broker cancels a consumer when its queue is deleted (amqplib then delivers
+   * null). Subscribe again while the registration is still wanted.
+   */
+  private _onConsumerCancelled(sub: SubscriptionRegistration, channel: amqplib.Channel) {
+    if (sub.consumer?.channel !== channel || this._channel !== channel) {
+      return;
+    }
+    sub.consumer = undefined;
+    if (!this._subscriptionRegistry.includes(sub)) {
+      return;
+    }
+    this._logger.warn(`RabbitMQ cancelled the consumer for ${sub.identifier}; subscribing again.`);
+    this._performSubscribe(sub).catch((err) => {
+      this._logger.error(`Failed to resubscribe ${sub.identifier} after a broker cancel`, err);
+    });
   }
 
   private async _resubscribeAll(): Promise<void> {
-    if (!this._channel || this._subscriptionRegistry.length === 0) {
+    // unsubscribe replaces the registry and subscribe() handles entries added from
+    // now on, so work on a snapshot and skip entries removed meanwhile.
+    const subs = [...this._subscriptionRegistry];
+    if (!this._channel || subs.length === 0) {
       return;
     }
-    this._logger.info(
-      `Resubscribing ${this._subscriptionRegistry.length} RabbitMQ subscription(s) after reconnect`,
-    );
-    const uniqueIds = new Set(this._subscriptionRegistry.map((s) => s.identifier));
-    for (const id of uniqueIds) {
-      const cacheKey = `${RabbitMqReceiver.CACHE_PREFIX}${id}`;
-      await this._cache.remove(cacheKey, CacheNamespace.Other);
+    this._logger.info(`Resubscribing ${subs.length} RabbitMQ subscription(s) after reconnect`);
+    for (const sub of subs) {
+      // Consumers on the previous channel died with it.
+      sub.consumer = undefined;
     }
-    for (const sub of this._subscriptionRegistry) {
+    for (const sub of subs) {
+      if (!this._subscriptionRegistry.includes(sub)) {
+        continue;
+      }
       try {
-        await this._performSubscribe(sub.identifier, sub.actions, sub.filter);
+        await this._performSubscribe(sub);
       } catch (err) {
         this._logger.error(
           `Failed to resubscribe RabbitMQ queue for ${sub.identifier}; messaging may be broken until reconnect.`,
