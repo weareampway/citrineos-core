@@ -146,7 +146,7 @@ export class WebhookDispatcher {
           try {
             callAction = mapToCallAction(protocol, rpcMessage[2]);
           } catch (error) {
-            this._logger.warn(`Failed to map call action ${callAction} for ${messageId}`, error);
+            this.warnOnUnmappedCallAction(protocol, rpcMessage[2], messageId, error);
           }
           if (relatedMessage && !relatedMessage.action) {
             // Update the related message with the correct action if it was missing
@@ -231,7 +231,7 @@ export class WebhookDispatcher {
           try {
             callAction = mapToCallAction(protocol, rpcMessage[2]);
           } catch (error) {
-            this._logger.warn(`Failed to map call action ${callAction} for ${messageId}`, error);
+            this.warnOnUnmappedCallAction(protocol, rpcMessage[2], messageId, error);
           }
           if (relatedMessage && !relatedMessage.action) {
             // Update the related message with the correct action if it was missing
@@ -423,6 +423,19 @@ export class WebhookDispatcher {
         return true;
       }
     };
+  }
+
+  private warnOnUnmappedCallAction(
+    protocol: OCPPVersionType,
+    action: string,
+    messageId: string,
+    error: unknown,
+  ) {
+    if (action === 'SecurityEventNotification') {
+      this._logger.info(`SecurityEventNotification is not a mapped ${protocol} action`, messageId);
+      return;
+    }
+    this._logger.warn(`Failed to map call action ${action} for ${messageId}`, error);
   }
 
   /**

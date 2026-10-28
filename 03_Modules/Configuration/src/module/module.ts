@@ -566,6 +566,25 @@ export class ConfigurationModule extends AbstractModule {
     this._logger.debug('FirmwareStatusNotification response sent: ', messageConfirmation);
   }
 
+  @AsHandler(OCPPVersion.OCPP1_6, OCPP1_6_CallAction.DataTransfer)
+  protected async _handleDataTransferOcpp16(
+    message: IMessage<OCPP1_6.DataTransferRequest>,
+    props?: HandlerProperties,
+  ): Promise<void> {
+    this._logger.info(
+      'DataTransfer vendor is not supported',
+      message.context.stationId,
+      message.payload.vendorId,
+      message.payload.messageId,
+    );
+    this._logger.debug('DataTransfer received:', message, props);
+
+    const response: OCPP1_6.DataTransferResponse = {
+      status: OCPP1_6.DataTransferResponseStatus.UnknownVendorId,
+    };
+    await this.sendCallResultWithMessage(message, response);
+  }
+
   @AsHandler(OCPPVersion.OCPP2_0_1, OCPP2_0_1_CallAction.DataTransfer)
   protected async _handleDataTransfer(
     message: IMessage<OCPP2_0_1.DataTransferRequest>,

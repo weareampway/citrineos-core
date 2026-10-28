@@ -499,12 +499,8 @@ export class MessageRouterImpl extends AbstractMessageRouter implements IMessage
         });
       }
 
-      // Ensure only one call is processed at a time
-      const callOngoing = this._cache.onChange(
-        identifier,
-        this.config.maxCallLengthSeconds,
-        CacheNamespace.Transactions,
-      );
+      // Ensure only one call is processed at a time. Subscribe only when the lock is
+      // already held — opening a subscriber for every call leaks a Redis client.
       let successfullySet = await this._cache.setIfNotExist(
         identifier,
         `${action}:${messageId}`,
@@ -513,6 +509,11 @@ export class MessageRouterImpl extends AbstractMessageRouter implements IMessage
       );
 
       if (!successfullySet) {
+        const callOngoing = this._cache.onChange(
+          identifier,
+          this.config.maxCallLengthSeconds,
+          CacheNamespace.Transactions,
+        );
         this._logger.debug(
           'Ongoing Call already in progress, waiting for ongoing call before handling',
           identifier,
@@ -536,6 +537,17 @@ export class MessageRouterImpl extends AbstractMessageRouter implements IMessage
         }
       }
     } catch (error) {
+      if (protocol === OCPPVersion.OCPP1_6 && message[2] === 'SecurityEventNotification') {
+        const callResult: CallResult = [MessageTypeId.CallResult, messageId, {}];
+        await this._sendMessage(identifier, protocol, JSON.stringify(callResult), callResult);
+        this._logger.warn(
+          'Acknowledged SecurityEventNotification on an OCPP 1.6 connection',
+          identifier,
+          message[3],
+        );
+        return;
+      }
+
       this._logger.error('Failed to process Call message', identifier, message, error);
 
       // Send manual reply since cache was unable to be set

@@ -52,53 +52,42 @@ export class RedisCache implements ICache {
     namespace?: string | undefined,
     classConstructor?: (() => ClassConstructor<T>) | undefined,
   ): Promise<T | null> {
-    namespace = namespace || '';
-    key = `${namespace}:${key}`;
+    const redisKey = this.prefixedKey(key, namespace);
 
     return new Promise((resolve) => {
-      // Create a Redis subscriber to listen for operations affecting the key
-      const subscriber = createClient();
-      // Channel: Key-space, message: the name of the event, which is the command executed on the key
-      subscriber
-        .subscribe(`__keyspace@0__:${key}`, (channel, message) => {
-          switch (message) {
-            case 'set':
-              resolve(this.get(key, namespace, classConstructor));
-              subscriber
-                .quit()
-                .then()
-                .catch((error) => {
-                  console.log('Error quitting subscriber', error);
-                });
-              break;
-            case 'del':
-            case 'expire':
-              resolve(null);
-              subscriber
-                .quit()
-                .then()
-                .catch((error) => {
-                  console.log('Error quitting subscriber', error);
-                });
-              break;
-            default:
-              // Do nothing
-              break;
-          }
-        })
-        .then()
-        .catch((error) => {
-          console.log('Error creating Redis subscriber', error);
-        });
-      setTimeout(() => {
-        resolve(this.get(key, namespace, classConstructor));
-        subscriber
-          .quit()
-          .then()
-          .catch((error) => {
-            console.log('Error closing Redis subscriber', error);
-          });
+      const subscriber = this._client.duplicate();
+      let settled = false;
+      const finish = (result: T | null | Promise<T | null>) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        clearTimeout(timer);
+        this.closeSubscriber(subscriber);
+        resolve(result);
+      };
+
+      // node-redis emits socket failures on 'error'. Without a listener that crashes the process.
+      subscriber.on('error', () => undefined);
+
+      const timer = setTimeout(() => {
+        finish(this.get(key, namespace, classConstructor));
       }, waitSeconds * 1000);
+
+      subscriber
+        .connect()
+        .then(() =>
+          subscriber.subscribe(`__keyspace@0__:${redisKey}`, (event) => {
+            if (event === 'set') {
+              finish(this.get(key, namespace, classConstructor));
+              return;
+            }
+            if (event === 'del' || event === 'expire') {
+              finish(null);
+            }
+          }),
+        )
+        .catch(() => undefined);
     });
   }
 
@@ -145,6 +134,19 @@ export class RedisCache implements ICache {
         }
         return false;
       });
+  }
+
+  private closeSubscriber(subscriber: RedisClientType<RedisModules, RedisFunctions, RedisScripts>) {
+    const disconnect = () => {
+      subscriber.disconnect().catch(() => undefined);
+    };
+    if (!subscriber.isOpen) {
+      disconnect();
+      return;
+    }
+    subscriber.quit().catch(() => {
+      disconnect();
+    });
   }
 
   private prefixedKey(key: string, namespace?: string): string {
