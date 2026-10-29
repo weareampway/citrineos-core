@@ -499,8 +499,8 @@ export class MessageRouterImpl extends AbstractMessageRouter implements IMessage
         });
       }
 
-      // Ensure only one call is processed at a time. Subscribe only when the lock is
-      // already held — opening a subscriber for every call leaks a Redis client.
+      // Ensure only one call is processed at a time. Wait for the lock only when it is
+      // already held, so an uncontended call costs a single SET NX.
       let successfullySet = await this._cache.setIfNotExist(
         identifier,
         `${action}:${messageId}`,
@@ -509,45 +509,35 @@ export class MessageRouterImpl extends AbstractMessageRouter implements IMessage
       );
 
       if (!successfullySet) {
-        const callOngoing = this._cache.onChange(
-          identifier,
-          this.config.maxCallLengthSeconds,
-          CacheNamespace.Transactions,
-        );
         this._logger.debug(
           'Ongoing Call already in progress, waiting for ongoing call before handling',
           identifier,
           message,
         );
-        await callOngoing; // Wait for ongoing call to finish
-        this._logger.debug('Ongoing Call finished, proceeding with call', identifier, message);
-        successfullySet = await this._cache.setIfNotExist(
-          identifier,
-          `${action}:${messageId}`,
-          CacheNamespace.Transactions,
-          this._config.maxCallLengthSeconds,
-        );
-        if (!successfullySet) {
-          throw new OcppError(
-            messageId,
-            ErrorCode.RpcFrameworkError,
-            'Call already in progress',
-            {},
+        // Every waiter wakes when the lock is released and only one gets it, so the others
+        // wait again until the deadline instead of failing right away.
+        const deadline = Date.now() + this._config.maxCallLengthSeconds * 1000;
+        while (!successfullySet) {
+          const remainingSeconds = (deadline - Date.now()) / 1000;
+          if (remainingSeconds <= 0) {
+            throw new OcppError(
+              messageId,
+              ErrorCode.RpcFrameworkError,
+              'Call already in progress',
+              {},
+            );
+          }
+          await this._cache.onChange(identifier, remainingSeconds, CacheNamespace.Transactions);
+          successfullySet = await this._cache.setIfNotExist(
+            identifier,
+            `${action}:${messageId}`,
+            CacheNamespace.Transactions,
+            this._config.maxCallLengthSeconds,
           );
         }
+        this._logger.debug('Ongoing Call finished, proceeding with call', identifier, message);
       }
     } catch (error) {
-      if (protocol === OCPPVersion.OCPP1_6 && message[2] === 'SecurityEventNotification') {
-        const callResult: CallResult = [MessageTypeId.CallResult, messageId, {}];
-        await this._sendMessage(identifier, protocol, JSON.stringify(callResult), callResult);
-        this._logger.warn(
-          'Acknowledged SecurityEventNotification on an OCPP 1.6 connection',
-          identifier,
-          message[3],
-        );
-        return;
-      }
-
       this._logger.error('Failed to process Call message', identifier, message, error);
 
       // Send manual reply since cache was unable to be set

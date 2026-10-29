@@ -20,6 +20,7 @@ import { createClient } from 'redis';
 export class RedisCache implements ICache {
   private _client: RedisClientType<RedisModules, RedisFunctions, RedisScripts>;
   private _namespacePrefix?: string;
+  private _subscriber?: RedisClientType<RedisModules, RedisFunctions, RedisScripts>;
 
   constructor(clientOptions?: RedisClientOptions, namespacePrefix?: string) {
     this._namespacePrefix = namespacePrefix;
@@ -53,9 +54,13 @@ export class RedisCache implements ICache {
     classConstructor?: (() => ClassConstructor<T>) | undefined,
   ): Promise<T | null> {
     const redisKey = this.prefixedKey(key, namespace);
+    const channel = `__keyspace@${this._client.options?.database ?? 0}__:${redisKey}`;
+    const subscriber = this.subscriber();
+    // Read before subscribing and compared once the subscription is live, so a change made
+    // while SUBSCRIBE is in flight is not missed. undefined means the read failed.
+    const valueBefore = this._client.get(redisKey).catch(() => undefined);
 
     return new Promise((resolve) => {
-      const subscriber = this._client.duplicate();
       let settled = false;
       const finish = (result: T | null | Promise<T | null>) => {
         if (settled) {
@@ -63,31 +68,55 @@ export class RedisCache implements ICache {
         }
         settled = true;
         clearTimeout(timer);
-        this.closeSubscriber(subscriber);
+        // Unsubscribe only after SUBSCRIBE has completed, otherwise its late reply re-adds the listener.
+        subscribed
+          .then((isSubscribed) =>
+            isSubscribed ? subscriber.unsubscribe(channel, listener) : undefined,
+          )
+          .catch((error) => {
+            console.warn('Redis keyspace unsubscribe failed', channel, error);
+          });
         resolve(result);
       };
 
-      // node-redis emits socket failures on 'error'. Without a listener that crashes the process.
-      subscriber.on('error', () => undefined);
+      // Message is the command run on the key. 'expire' only means a TTL was set (SET ... EX
+      // sends it right after 'set'); a key that times out sends 'expired'.
+      const listener = (event: string) => {
+        if (event === 'set') {
+          finish(this.get(key, namespace, classConstructor));
+          return;
+        }
+        if (event === 'del' || event === 'expired' || event === 'evicted') {
+          finish(null);
+        }
+      };
 
       const timer = setTimeout(() => {
         finish(this.get(key, namespace, classConstructor));
       }, waitSeconds * 1000);
 
-      subscriber
-        .connect()
-        .then(() =>
-          subscriber.subscribe(`__keyspace@0__:${redisKey}`, (event) => {
-            if (event === 'set') {
-              finish(this.get(key, namespace, classConstructor));
-              return;
-            }
-            if (event === 'del' || event === 'expire') {
-              finish(null);
-            }
-          }),
-        )
-        .catch(() => undefined);
+      const subscribed = subscriber.subscribe(channel, listener).then(
+        () => true,
+        (error) => {
+          console.warn('Redis keyspace subscribe failed', channel, error);
+          return false;
+        },
+      );
+
+      subscribed
+        .then(async (isSubscribed) => {
+          const before = await valueBefore;
+          if (!isSubscribed || settled || before === undefined) {
+            return;
+          }
+          const current = await this._client.get(redisKey);
+          if (current !== before) {
+            finish(this.get(key, namespace, classConstructor));
+          }
+        })
+        .catch((error) => {
+          console.warn('Redis keyspace re-check failed', channel, error);
+        });
     });
   }
 
@@ -136,17 +165,21 @@ export class RedisCache implements ICache {
       });
   }
 
-  private closeSubscriber(subscriber: RedisClientType<RedisModules, RedisFunctions, RedisScripts>) {
-    const disconnect = () => {
-      subscriber.disconnect().catch(() => undefined);
-    };
-    if (!subscriber.isOpen) {
-      disconnect();
-      return;
+  /**
+   * One long-lived connection for all keyspace subscriptions. node-redis keeps a listener set per
+   * channel and resubscribes after a reconnect, so waits only SUBSCRIBE and UNSUBSCRIBE on it.
+   */
+  private subscriber(): RedisClientType<RedisModules, RedisFunctions, RedisScripts> {
+    if (!this._subscriber) {
+      const subscriber = this._client.duplicate();
+      // node-redis emits socket failures on 'error'. Without a listener that crashes the process.
+      subscriber.on('error', (error) => console.warn('Redis subscriber error', error));
+      subscriber.connect().catch((error) => {
+        console.warn('Error connecting Redis subscriber', error);
+      });
+      this._subscriber = subscriber;
     }
-    subscriber.quit().catch(() => {
-      disconnect();
-    });
+    return this._subscriber;
   }
 
   private prefixedKey(key: string, namespace?: string): string {

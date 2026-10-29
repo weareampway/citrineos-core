@@ -132,6 +132,7 @@ export const OCPP1_6_CALL_SCHEMA_MAP: Map<CallAction, object> = new Map<OCPP1_6_
     ],
     [OCPP1_6_CallAction.Heartbeat, OCPP1_6.HeartbeatRequestSchema],
     [OCPP1_6_CallAction.MeterValues, OCPP1_6.MeterValuesRequestSchema],
+    [OCPP1_6_CallAction.SecurityEventNotification, OCPP1_6.SecurityEventNotificationRequestSchema],
     [OCPP1_6_CallAction.StartTransaction, OCPP1_6.StartTransactionRequestSchema],
     [OCPP1_6_CallAction.StatusNotification, OCPP1_6.StatusNotificationRequestSchema],
     [OCPP1_6_CallAction.StopTransaction, OCPP1_6.StopTransactionRequestSchema],
