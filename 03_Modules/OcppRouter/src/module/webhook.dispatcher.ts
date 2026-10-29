@@ -146,7 +146,7 @@ export class WebhookDispatcher {
           try {
             callAction = mapToCallAction(protocol, rpcMessage[2]);
           } catch (error) {
-            this._logger.warn(`Failed to map call action ${callAction} for ${messageId}`, error);
+            this._logger.warn(`Failed to map call action ${rpcMessage[2]} for ${messageId}`, error);
           }
           if (relatedMessage && !relatedMessage.action) {
             // Update the related message with the correct action if it was missing
@@ -231,7 +231,7 @@ export class WebhookDispatcher {
           try {
             callAction = mapToCallAction(protocol, rpcMessage[2]);
           } catch (error) {
-            this._logger.warn(`Failed to map call action ${callAction} for ${messageId}`, error);
+            this._logger.warn(`Failed to map call action ${rpcMessage[2]} for ${messageId}`, error);
           }
           if (relatedMessage && !relatedMessage.action) {
             // Update the related message with the correct action if it was missing

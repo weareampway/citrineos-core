@@ -342,6 +342,20 @@ export class ReportingModule extends AbstractModule {
     );
   }
 
+  @AsHandler(OCPPVersion.OCPP1_6, OCPP1_6_CallAction.SecurityEventNotification)
+  protected async _handleOcpp16SecurityEventNotification(
+    message: IMessage<OCPP1_6.SecurityEventNotificationRequest>,
+    props?: HandlerProperties,
+  ): Promise<void> {
+    this._logger.debug('OCPP 1.6 SecurityEventNotification request received:', message, props);
+    await this._securityEventRepository.createByStationId(
+      message.context.tenantId,
+      message.payload,
+      message.context.stationId,
+    );
+    await this.sendCallResultWithMessage(message, {} as OCPP1_6.SecurityEventNotificationResponse);
+  }
+
   /**
    * Handle responses
    */

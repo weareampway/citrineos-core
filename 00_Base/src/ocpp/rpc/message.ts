@@ -81,6 +81,8 @@ export enum OCPP1_6_CallAction {
   RemoteStopTransaction = 'RemoteStopTransaction',
   ReserveNow = 'ReserveNow',
   Reset = 'Reset',
+  // OCPP 1.6 Security Extension
+  SecurityEventNotification = 'SecurityEventNotification',
   SendLocalList = 'SendLocalList',
   SetChargingProfile = 'SetChargingProfile',
   StartTransaction = 'StartTransaction',

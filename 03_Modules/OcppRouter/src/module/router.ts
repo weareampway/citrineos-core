@@ -499,12 +499,8 @@ export class MessageRouterImpl extends AbstractMessageRouter implements IMessage
         });
       }
 
-      // Ensure only one call is processed at a time
-      const callOngoing = this._cache.onChange(
-        identifier,
-        this.config.maxCallLengthSeconds,
-        CacheNamespace.Transactions,
-      );
+      // Ensure only one call is processed at a time. Wait for the lock only when it is
+      // already held, so an uncontended call costs a single SET NX.
       let successfullySet = await this._cache.setIfNotExist(
         identifier,
         `${action}:${messageId}`,
@@ -518,22 +514,28 @@ export class MessageRouterImpl extends AbstractMessageRouter implements IMessage
           identifier,
           message,
         );
-        await callOngoing; // Wait for ongoing call to finish
-        this._logger.debug('Ongoing Call finished, proceeding with call', identifier, message);
-        successfullySet = await this._cache.setIfNotExist(
-          identifier,
-          `${action}:${messageId}`,
-          CacheNamespace.Transactions,
-          this._config.maxCallLengthSeconds,
-        );
-        if (!successfullySet) {
-          throw new OcppError(
-            messageId,
-            ErrorCode.RpcFrameworkError,
-            'Call already in progress',
-            {},
+        // Every waiter wakes when the lock is released and only one gets it, so the others
+        // wait again until the deadline instead of failing right away.
+        const deadline = Date.now() + this._config.maxCallLengthSeconds * 1000;
+        while (!successfullySet) {
+          const remainingSeconds = (deadline - Date.now()) / 1000;
+          if (remainingSeconds <= 0) {
+            throw new OcppError(
+              messageId,
+              ErrorCode.RpcFrameworkError,
+              'Call already in progress',
+              {},
+            );
+          }
+          await this._cache.onChange(identifier, remainingSeconds, CacheNamespace.Transactions);
+          successfullySet = await this._cache.setIfNotExist(
+            identifier,
+            `${action}:${messageId}`,
+            CacheNamespace.Transactions,
+            this._config.maxCallLengthSeconds,
           );
         }
+        this._logger.debug('Ongoing Call finished, proceeding with call', identifier, message);
       }
     } catch (error) {
       this._logger.error('Failed to process Call message', identifier, message, error);
