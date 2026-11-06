@@ -36,7 +36,9 @@ export class RabbitMqStationReceiver extends RabbitMqReceiver {
     let station = this.stations.get(identifier);
     if (!station) {
       const receiver = new RabbitMqReceiver(this._config, this._logger, this.module);
-      station = { receiver, ready: receiver.initConnection() };
+      // A new WebSocket must finish or fail registration so its caller can clean up.
+      // Once connected, the receiver still recovers its consumers in the background.
+      station = { receiver, ready: receiver.initConnection({ retry: false }) };
       this.stations.set(identifier, station);
     }
 

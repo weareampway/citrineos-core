@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { EventEmitter } from 'node:events';
-import type { SystemConfig } from '@citrineos/base';
+import type { IModule, SystemConfig } from '@citrineos/base';
+import { RetryMessageError } from '@citrineos/base';
 import type { Channel } from 'amqplib';
 import { Logger } from 'tslog';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
@@ -18,6 +19,8 @@ function channel() {
     bindQueue: vi.fn().mockResolvedValue({}),
     consume: vi.fn().mockResolvedValue({ consumerTag: 'tag' }),
     close: vi.fn().mockResolvedValue(undefined),
+    ack: vi.fn(),
+    nack: vi.fn(),
   });
 }
 const asChannel = (broker: ReturnType<typeof channel>) => broker as unknown as Channel;
@@ -64,6 +67,69 @@ describe('router station channels', () => {
     await router.shutdown();
     expect(b.close).toHaveBeenCalledOnce();
     expect(control.close).toHaveBeenCalledOnce();
+  });
+
+  it.each(['success', 'retry'])(
+    'does not settle a delivery on a retired channel after handler %s',
+    async (outcome) => {
+      const broker = channel();
+      vi.mocked(getSharedChannel).mockResolvedValue(asChannel(broker));
+      const router = receiver();
+      let finish!: () => void;
+      const pending = new Promise<void>((resolve) => {
+        finish = resolve;
+      });
+      const handle = vi.fn(async () => {
+        if (outcome === 'retry') throw new RetryMessageError('Call in progress');
+      });
+      router.module = { handle } as unknown as IModule;
+      await router.subscribe('A');
+      const consume = broker.consume.mock.calls[0][1];
+      const message = { content: Buffer.from('{}'), properties: {} };
+      await consume(message);
+      const settle = outcome === 'retry' ? broker.nack : broker.ack;
+      expect(settle).toHaveBeenCalledOnce();
+
+      handle.mockImplementationOnce(async () => {
+        await pending;
+        if (outcome === 'retry') throw new RetryMessageError('Call in progress');
+      });
+      const delivery = consume(message);
+      expect(handle).toHaveBeenCalledTimes(2);
+
+      await router.unsubscribe('A');
+      expect(broker.close).toHaveBeenCalledOnce();
+      finish();
+      await expect(delivery).resolves.toBeUndefined();
+      expect(broker.ack).toHaveBeenCalledTimes(outcome === 'success' ? 1 : 0);
+      expect(broker.nack).toHaveBeenCalledTimes(outcome === 'retry' ? 1 : 0);
+      await router.shutdown();
+    },
+  );
+
+  it('rejects initial registrations during a broker outage and lets the station try again', async () => {
+    vi.useFakeTimers();
+    const router = receiver();
+    try {
+      vi.mocked(getSharedChannel).mockRejectedValue(new Error('Broker offline'));
+      const registrations = Promise.allSettled([
+        router.subscribe('A', undefined, { state: 'request' }),
+        router.subscribe('A', undefined, { state: 'response' }),
+        router.subscribe('B'),
+      ]);
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(getSharedChannel).toHaveBeenCalledTimes(2);
+      expect(await registrations).toEqual(
+        Array(3).fill({ status: 'rejected', reason: new Error('Broker offline') }),
+      );
+      expect(vi.getTimerCount()).toBe(0);
+
+      vi.mocked(getSharedChannel).mockResolvedValue(asChannel(channel()));
+      await expect(router.subscribe('A')).resolves.toBe(true);
+    } finally {
+      await router.shutdown();
+      vi.useRealTimers();
+    }
   });
 
   it('retires a late channel without disturbing a replacement for the same identifier', async () => {

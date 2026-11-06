@@ -17,11 +17,16 @@ it.skipIf(!url)(
     if (!url || !['localhost', '127.0.0.1', '[::1]'].includes(new URL(url).hostname)) {
       throw new Error('Use a disposable local RabbitMQ broker for this test.');
     }
+    const limitedUrl = new URL(url);
+    limitedUrl.searchParams.set('channelMax', '56'); // Control channel plus 55 stations.
+    const routerUrl = limitedUrl.toString();
     const prefix = `test-${randomUUID()}-`;
     const probe = await amqp.connect(url);
     const router = new RabbitMqStationReceiver(
       {
-        util: { messageBroker: { amqp: { url, exchange: prefix, queuePrefix: prefix } } },
+        util: {
+          messageBroker: { amqp: { url: routerUrl, exchange: prefix, queuePrefix: prefix } },
+        },
       } as SystemConfig,
       new Logger({ minLevel: 7 }),
     );
@@ -41,6 +46,7 @@ it.skipIf(!url)(
       for (const id of stations) {
         expect((await channel.checkQueue(`${prefix}exp_${id}`)).consumerCount).toBe(2);
       }
+      await expect(subscribe('1:overflow')).rejects.toThrow('No channels left to allocate');
       await router.unsubscribe(stations[0]);
       expect((await channel.checkQueue(`${prefix}exp_${stations[0]}`)).consumerCount).toBe(0);
       expect((await channel.checkQueue(`${prefix}exp_${stations[1]}`)).consumerCount).toBe(2);
@@ -55,7 +61,7 @@ it.skipIf(!url)(
       await channel.deleteExchange(prefix);
     } finally {
       await router.shutdown();
-      clearPoolForUrl(url);
+      clearPoolForUrl(routerUrl);
       await probe.close();
     }
   },
