@@ -13,6 +13,7 @@ import * as amqplib from 'amqplib';
 import type { ILogObj } from 'tslog';
 import { RabbitMqConnectionHealth, retireRabbitChannel } from './connection-health.js';
 import { getSharedChannel } from './shared-connection-pool.js';
+import { stationDeliveryIsCurrent } from './station-delivery.js';
 import { Logger } from 'tslog';
 
 /**
@@ -465,6 +466,12 @@ export class RabbitMqReceiver extends AbstractMessageHandler {
       if (msg === null) {
         this._onConsumerCancelled(sub, channel);
         return;
+      }
+      if (stationQueue) {
+        return stationDeliveryIsCurrent.run(
+          () => this._channel === channel,
+          () => this._onMessage(msg, channel),
+        );
       }
       return this._onMessage(msg, channel);
     });
