@@ -28,6 +28,7 @@ import type { ILogObj } from 'tslog';
 import { Logger } from 'tslog';
 import type { ErrorEvent, MessageEvent } from 'ws';
 import { WebSocket, WebSocketServer } from 'ws';
+import { stationDeliveryIsCurrent } from '../queue/rabbit-mq/station-delivery.js';
 import type { IUpgradeError } from './authenticator/errors/IUpgradeError.js';
 
 export class WebsocketNetworkConnection implements INetworkConnection {
@@ -74,39 +75,31 @@ export class WebsocketNetworkConnection implements INetworkConnection {
    * @param {string} message - The message to send.
    * @return {void} rejects the promise if message fails to send, otherwise returns void.
    */
-  sendMessage(identifier: string, message: string): Promise<void> {
-    return new Promise<void>(async (resolve, reject) => {
-      try {
-        const clientConnection = await this._cache.get(identifier, CacheNamespace.Connections);
-        if (clientConnection) {
-          const websocketConnection = this._identifierConnections.get(identifier);
-          if (websocketConnection && websocketConnection.readyState === WebSocket.OPEN) {
-            websocketConnection.send(message, (error) => {
-              if (error) {
-                reject(error); // Reject the promise with the error
-              } else {
-                resolve(); // Resolve the promise with true indicating success
-              }
-            });
-          } else {
-            const errorMsg = 'Websocket connection is not ready - ' + identifier;
-            this._logger.fatal(errorMsg);
-            websocketConnection?.close(1011, errorMsg);
-            reject(new Error(errorMsg)); // Reject with a new error
-          }
-        } else {
-          const errorMsg = 'Cannot identify client connection for ' + identifier;
-          // This can happen when a charging station disconnects in the moment a message is trying to send.
-          // Retry logic on the message sender might not suffice as charging station might connect to different instance.
-          this._logger.error(errorMsg);
-          this._identifierConnections
-            .get(identifier)
-            ?.close(1011, 'Failed to get connection information for ' + identifier);
-          reject(new Error(errorMsg)); // Reject with a new error
-        }
-      } catch (error) {
-        reject(error);
-      }
+  async sendMessage(identifier: string, message: string): Promise<void> {
+    const clientConnection = await this._cache.get(identifier, CacheNamespace.Connections);
+    // Disconnect may retire the delivery while the router or the cache lookup is
+    // awaiting I/O. Its redelivery owns the send to the replacement socket.
+    if (stationDeliveryIsCurrent.getStore()?.() === false) {
+      throw new Error('RabbitMQ channel retired before WebSocket send');
+    }
+    const socket = this._identifierConnections.get(identifier);
+    if (!clientConnection) {
+      const errorMsg = 'Cannot identify client connection for ' + identifier;
+      this._logger.error(errorMsg);
+      socket?.close(1011, 'Failed to get connection information');
+      throw new Error(errorMsg);
+    }
+    if (!socket || socket.readyState !== WebSocket.OPEN) {
+      const errorMsg = 'Websocket connection is not ready - ' + identifier;
+      this._logger.fatal(errorMsg);
+      socket?.close(1011, 'Websocket connection is not ready');
+      throw new Error(errorMsg);
+    }
+    await new Promise<void>((resolve, reject) => {
+      socket.send(message, (error) => {
+        if (error) reject(error);
+        else resolve();
+      });
     });
   }
 
@@ -324,6 +317,18 @@ export class WebsocketNetworkConnection implements INetworkConnection {
       const tenantId = websocketServerConfig.tenantId;
       const identifier = createIdentifier(tenantId, stationId);
 
+      // Rejected sockets also need an error listener while the close handshake runs.
+      ws.onerror = (event: ErrorEvent) => {
+        this._logger.error(
+          'Connection error encountered for',
+          identifier,
+          event.error,
+          event.message,
+          event.type,
+        );
+        ws.close(1011, 'WebSocket connection error');
+      };
+
       const existing = this._identifierConnections.get(identifier);
       this._identifierConnections.set(identifier, ws);
       if (existing && existing !== ws) {
@@ -374,7 +379,9 @@ export class WebsocketNetworkConnection implements INetworkConnection {
         ws.resume();
       } catch (error) {
         this._logger.fatal('Failed to subscribe to message broker for ', identifier);
-        ws.close(1011, 'Failed to subscribe to message broker for ' + identifier);
+        ws.close(1011, 'Failed to subscribe to message broker');
+        // Registration paused the socket; read the peer's close acknowledgment.
+        ws.resume();
         // registerConnection may have subscribed or marked the station online before failing.
         this._deregisterIfCurrent(identifier, ws);
       }
@@ -408,16 +415,6 @@ export class WebsocketNetworkConnection implements INetworkConnection {
    * @return {void} This function does not return anything.
    */
   private _registerWebsocketEvents(identifier: string, ws: WebSocket, pingInterval: number): void {
-    ws.onerror = (event: ErrorEvent) => {
-      this._logger.error(
-        'Connection error encountered for',
-        identifier,
-        event.error,
-        event.message,
-        event.type,
-      );
-      ws.close(1011, event.message);
-    };
     ws.onmessage = (event: MessageEvent) => {
       this._onMessage(identifier, event.data.toString(), ws.protocol as OCPPVersionType);
     };

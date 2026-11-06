@@ -9,6 +9,16 @@ on:
 jobs:
   tests:
     runs-on: ubuntu-latest
+    services:
+      rabbitmq:
+        image: rabbitmq:4.2-alpine
+        env:
+          RABBITMQ_SERVER_ADDITIONAL_ERL_ARGS: "-rabbit consumer_max_per_channel 2"
+        ports:
+          - 5672/tcp
+        options: >-
+          --health-cmd "rabbitmq-diagnostics -q check_port_connectivity"
+          --health-interval 5s --health-timeout 5s --health-retries 12
 
     steps:
       - name: Checkout repository
@@ -35,5 +45,6 @@ jobs:
 
       - name: Run tests
         env:
+          CITRINEOS_TEST_RABBITMQ_URL: amqp://127.0.0.1:${{ job.services.rabbitmq.ports[5672] }}
           NODE_OPTIONS: "--max_old_space_size=4096"
         run: npm test

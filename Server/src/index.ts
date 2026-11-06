@@ -70,6 +70,7 @@ import {
   NetworkProfileFilter,
   OIDCAuthProvider,
   RabbitMqReceiver,
+  RabbitMqStationReceiver,
   RabbitMqSender,
   rabbitMqClientsAreUnhealthy,
   RealTimeAuthorizer,
@@ -403,11 +404,13 @@ export class CitrineOSServer {
       this._logger,
     );
 
+    const stationReceiver = new RabbitMqStationReceiver(this._config, this._logger);
+    this._rabbitClients.push(stationReceiver);
     this._router = new MessageRouterImpl(
       this._config,
       this._cache,
       this._createSender(),
-      this._createHandler(),
+      stationReceiver,
       webhookDispatcher,
       async (_identifier: string, _message: string) => {},
       this._logger,

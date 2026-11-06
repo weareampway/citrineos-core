@@ -13,6 +13,7 @@ import * as amqplib from 'amqplib';
 import type { ILogObj } from 'tslog';
 import { RabbitMqConnectionHealth, retireRabbitChannel } from './connection-health.js';
 import { getSharedChannel } from './shared-connection-pool.js';
+import { stationDeliveryIsCurrent } from './station-delivery.js';
 import { Logger } from 'tslog';
 
 /**
@@ -89,11 +90,11 @@ export class RabbitMqReceiver extends AbstractMessageHandler {
     return this._connectionHealth.disconnectedSince;
   }
 
-  async initConnection(): Promise<any> {
+  async initConnection({ retry = true } = {}): Promise<void> {
     if (this._circuitBreaker.state === 'CLOSED') {
       throw new Error('Circuit breaker is CLOSED. Cannot initialize RabbitMQ connection.');
     }
-    await this._connectWithRetry(this._abortReconnectController.signal);
+    await this._connectWithRetry(this._abortReconnectController.signal, retry);
   }
 
   /**
@@ -185,28 +186,35 @@ export class RabbitMqReceiver extends AbstractMessageHandler {
 
   /**
    * Connect to RabbitMQ with retry logic.
-   * This method will keep trying to connect until successful, unless aborted.
+   * Recovery retries until connected or aborted. A new station can request one attempt.
    *
    * @param {AbortSignal} [abortSignal] - Optional abort signal to stop retrying.
+   * @param {boolean} [retry] - Whether to retry after a failed attempt.
    * @return {Promise<amqplib.Channel>} A promise that resolves to the AMQP channel.
    */
   protected _connectWithRetry(
     abortSignal = this._abortReconnectController.signal,
+    retry = true,
   ): Promise<amqplib.Channel> {
     // Initial connection, interval retries and breaker callbacks share one attempt.
-    this._connectionAttempt ??= this._connectAndSubscribeWithRetry(abortSignal).finally(() => {
-      this._connectionAttempt = undefined;
-    });
+    this._connectionAttempt ??= this._connectAndSubscribeWithRetry(abortSignal, retry).finally(
+      () => {
+        this._connectionAttempt = undefined;
+      },
+    );
     return this._connectionAttempt;
   }
 
-  private async _connectAndSubscribeWithRetry(abortSignal?: AbortSignal): Promise<amqplib.Channel> {
+  private async _connectAndSubscribeWithRetry(
+    abortSignal: AbortSignal,
+    retry: boolean,
+  ): Promise<amqplib.Channel> {
     const url = this._config.util.messageBroker.amqp?.url;
     if (!url) {
       throw new Error('RabbitMQ URL is not configured');
     }
     while (true) {
-      if (this._stopped || abortSignal?.aborted) {
+      if (this._stopped || abortSignal.aborted) {
         this._logger.warn('RabbitMQ reconnect aborted by signal.');
         throw new Error('RabbitMQ reconnect aborted');
       }
@@ -218,7 +226,7 @@ export class RabbitMqReceiver extends AbstractMessageHandler {
         await retireRabbitChannel(this._channel);
         this._channel = undefined;
         const channel = await getSharedChannel(url, this._logger);
-        if (this._stopped || abortSignal?.aborted) {
+        if (this._stopped || abortSignal.aborted) {
           await retireRabbitChannel(channel);
           throw new Error('RabbitMQ reconnect aborted');
         }
@@ -233,14 +241,14 @@ export class RabbitMqReceiver extends AbstractMessageHandler {
         });
         this._channel = channel;
         await this._resubscribeAll();
-        if (this._channel !== channel || this._stopped || abortSignal?.aborted) {
+        if (this._channel !== channel || this._stopped || abortSignal.aborted) {
           throw new Error('RabbitMQ channel closed while restoring subscriptions.');
         }
         this._connectionHealth.markConnected();
         this._circuitBreaker.triggerSuccess();
         return channel;
       } catch (err) {
-        if (this._stopped || abortSignal?.aborted) throw err;
+        if (!retry || this._stopped || abortSignal.aborted) throw err;
         this._logger.error('RabbitMQ connect failed, triggering circuit breaker failure', err);
         this._connectionHealth.noteDisconnected();
         this._circuitBreaker.triggerFailure((err as Error)?.message);
@@ -261,6 +269,7 @@ export class RabbitMqReceiver extends AbstractMessageHandler {
     channel: amqplib.Channel,
   ): Promise<void> {
     if (message) {
+      let requeue = false;
       try {
         this._logger.debug(
           '_onMessage:Received message:',
@@ -284,13 +293,22 @@ export class RabbitMqReceiver extends AbstractMessageHandler {
         if (error instanceof RetryMessageError) {
           this._logger.warn('Retrying message: ', error.message);
           // Retryable error, usually ongoing call with station when trying to send new call
-          channel.nack(message);
-          return;
+          requeue = true;
         } else {
           this._logger.error('Error while processing message:', error, message);
         }
       }
-      channel.ack(message);
+      // RabbitMQ requeues unsettled deliveries when their channel closes. Delivery
+      // tags belong to that channel and cannot be acknowledged on its replacement.
+      if (this._channel !== channel) return;
+      try {
+        if (requeue) channel.nack(message);
+        else channel.ack(message);
+      } catch (err) {
+        // amqplib can already be closing before it emits the channel's close event.
+        this._logger.warn('Could not settle RabbitMQ delivery', err);
+        this._handleDisconnect();
+      }
     }
   }
 
@@ -448,6 +466,12 @@ export class RabbitMqReceiver extends AbstractMessageHandler {
       if (msg === null) {
         this._onConsumerCancelled(sub, channel);
         return;
+      }
+      if (stationQueue) {
+        return stationDeliveryIsCurrent.run(
+          () => this._channel === channel,
+          () => this._onMessage(msg, channel),
+        );
       }
       return this._onMessage(msg, channel);
     });

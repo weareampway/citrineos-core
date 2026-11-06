@@ -75,11 +75,11 @@ describe('WebsocketNetworkConnection server deletion', () => {
     return { ...config, port: (httpServers.get(id)!.address() as AddressInfo).port };
   }
 
-  async function connectCharger(config: WebsocketServerConfig): Promise<WebSocket> {
-    const client = new WebSocket(
-      `ws://${config.host}:${config.port}/charger-${config.id}`,
-      'ocpp1.6',
-    );
+  async function connectCharger(
+    config: WebsocketServerConfig,
+    stationId = `charger-${config.id}`,
+  ): Promise<WebSocket> {
+    const client = new WebSocket(`ws://${config.host}:${config.port}/${stationId}`, 'ocpp1.6');
     clients.push(client);
     await once(client, 'open');
     return client;
@@ -145,6 +145,19 @@ describe('WebsocketNetworkConnection server deletion', () => {
     await connectCharger(await startServer('7'));
 
     await vi.waitFor(() => expect(deregisterConnection).toHaveBeenCalledWith(1, 'charger-7'));
+  });
+
+  it('closes and deregisters a rejected station whose ID exceeds the close reason limit', async () => {
+    const stationId = 'A'.repeat(100);
+    registerConnection.mockResolvedValueOnce(false);
+    const config = await startServer('overflow');
+    const rejected = await connectCharger(config, stationId);
+    const [code, reason] = await withinDeadline(once(rejected, 'close'));
+
+    expect(code).toBe(1011);
+    expect(reason.toString()).toBe('Failed to subscribe to message broker');
+    expect(deregisterConnection).toHaveBeenCalledWith(1, stationId);
+    expect((await connectCharger(config, stationId)).readyState).toBe(WebSocket.OPEN);
   });
 
   it('deregisters a charger whose socket closed while it was being registered', async () => {

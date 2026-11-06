@@ -74,17 +74,17 @@ export async function getSharedChannel(
         return channel;
       }),
       new Promise<never>((_, reject) => {
-        timeout = setTimeout(
-          () => reject(new Error('RabbitMQ channel creation timed out')),
-          10_000,
-        );
+        timeout = setTimeout(() => {
+          // A stalled channel open can indicate a half-open transport. A rejected
+          // open (e.g. channelMax reached) leaves other channels usable.
+          if (pool.entry === entry) {
+            pool.entry = null;
+            void entry.connection.close().catch(() => {});
+          }
+          reject(new Error('RabbitMQ channel creation timed out'));
+        }, 10_000);
       }),
     ]);
-  } catch (err) {
-    // A half-open transport may never emit error/close. Do not reuse it forever.
-    if (pool.entry === entry) pool.entry = null;
-    void entry.connection.close().catch(() => {});
-    throw err;
   } finally {
     if (timeout) clearTimeout(timeout);
   }
